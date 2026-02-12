@@ -1,0 +1,18 @@
+[project]
+name = "playpen-attribution"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "bergson",
+    "datasets>=4.5.0",
+    "peft>=0.18.1",
+    "sae-lens>=6.36.0",
+    "torch>=2.10.0",
+    "transformers>=4.55.0,<4.56.0",
+    "trl>=0.22,<0.23",
+]
+
+[tool.uv.sources]
+bergson = { path = "../bergson", editable = true }
