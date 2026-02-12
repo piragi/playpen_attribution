@@ -2,191 +2,171 @@
 
 ## Goal
 Build a reproducible pipeline for:
-1. Training a LoRA SFT model on playpen game data.
-2. Running gradient-based data attribution to identify high-impact training instances/words for learning behavior.
-3. Using those insights to generate similarly hard words later (mechanistic-interpretability-driven iteration).
+1. LoRA SFT on playpen game data.
+2. Gradient-based data attribution to identify high-impact training examples.
+3. SAE-based analysis of top-attributed data to characterize feature patterns that correlate with influence.
 
-Current scope is step 1 + step 2.
+Current focus is a working end-to-end baseline for steps 1-3.
 
 ## Tooling Rules
-1. Always run Python and scripts with `uv` (for consistency and reproducibility).
-2. Build attribution on top of the local Bergson library at `../bergson`.
-3. Keep scripts simple and config-driven.
+1. Always run scripts with `uv`.
+2. Use local Bergson source at `../bergson`.
+3. Keep scripts simple and config-driven (single `CONFIG` dict per script).
 
 ## Repository Workflow
-1. Dataset prep:
-   - Source: `colab-potsdam/playpen-data` (`interactions` config).
-   - Filter to one game/role at a time.
-   - Drop `aborted` outcomes.
-2. SFT (LoRA):
-   - Script: `data.py`.
-   - Model: Gemma 3 1B Instruct with LoRA target modules.
-   - Train/eval split comes from dataset `train` + `validation`.
-3. Attribution (current target):
-   - Use Bergson `reduce` + `score` flow for val-query vs train-index scoring.
+1. Prepare filtered train/validation data from `colab-potsdam/playpen-data` (`interactions`).
+2. Train LoRA SFT adapter (`data.py`).
+3. Run Bergson reduce+score attribution (`score_samples.py`).
+4. Run SAE feature extraction on filtered training rows (`sae_analysis.py`).
+5. Run contrast/regression analysis on cached SAE arrays (`sae_contrast.py`).
 
-## Current SFT Setup
-Reference script:
-- `data.py`
+## Current Script Roles
 
-Behavior:
-1. Filters train/eval with:
-   - game match
-   - role match
-   - `outcome != "aborted"`
-2. Trains LoRA adapters with `trl.SFTTrainer`.
-3. Saves adapter to `./taboo_sft_lora`.
-4. Uses prompt/completion conversion + `completion_only_loss=True` as a temporary workaround for Gemma chat-template masking limitations.
+### `data.py`
+Purpose:
+1. Filter by game/role and drop aborted outcomes.
+2. Convert conversation to prompt/completion.
+3. Train Gemma-3-1B-it LoRA via `trl.SFTTrainer`.
 
-## Bergson Attribution Plan (Reduce + Score)
-
-### Why this path
-Bergson documents two main workflows:
-1. Build full gradient index then query repeatedly.
-2. Reduce query set + score a dataset against that query.
-
-For this repo, we want one fixed query set (validation), so use reduce+score first.
+Current training policy:
+1. `completion_only_loss=True`
+2. `assistant_only_loss=False`
+3. LoRA target modules: attention + MLP projections.
 
 References:
-- `../bergson/README.md:52`
-- `../bergson/docs/cli.rst:9`
+1. `data.py:43`
+2. `data.py:56`
+3. `data.py:113`
+4. `data.py:125`
 
-### Math and semantics
+### `score_samples.py`
+Purpose:
+1. Build filtered train/val splits with stable `row_id`.
+2. Run Bergson `reduce` on validation.
+3. Run Bergson `score` on train and dump top/bottom examples.
+
+Current attribution setup:
+1. `score_mode="mean"`
+2. `unit_normalize=True`
+3. `preconditioning.mode="mixed"`
+4. `preconditioning.projection_dim=32`
+5. `mixing_coefficient=0.99`
+
+References:
+1. `score_samples.py:15`
+2. `score_samples.py:138`
+3. `score_samples.py:176`
+4. `score_samples.py:189`
+5. `score_samples.py:232`
+
+### `sae_analysis.py`
+Purpose:
+1. Run SAE encode on prompts.
+2. Aggregate layer-level top features.
+3. Save per-sample arrays for fast downstream analysis.
+
+Current default mode:
+1. `input_mode="train_dataset"`
+2. Loads full filtered train split from `runs/taboo_attr/data/train`
+3. Defaults to `layer_17_width_16k_l0_small`
+4. Saves per-sample outputs to `runs/taboo_attr/sae_samples_layer17_all_train`
+
+Per-sample arrays schema:
+1. `feature_presence`: `[n_samples, d_sae]` bool.
+2. `sample_stats`: `[n_samples, 10]` float32.
+3. `seq_lens`: `[n_samples]` int32.
+4. `stat_feature_names`: names of the 10 sample stats.
+
+References:
+1. `sae_analysis.py:12`
+2. `sae_analysis.py:51`
+3. `sae_analysis.py:270`
+4. `sae_analysis.py:343`
+5. `sae_analysis.py:505`
+
+### `sae_contrast.py`
+Purpose:
+1. Load Bergson train scores.
+2. Load precomputed SAE arrays (`.npz`) + metadata (`examples.jsonl`).
+3. Label top-k attributed rows vs rest.
+4. Fit weighted logistic regression on `sample_stats`.
+5. Report AUC + per-feature enrichment/depletion from `feature_presence`.
+
+Important change:
+1. No model/SAE forward pass here anymore.
+2. It is now a fast analysis script on cached arrays.
+
+References:
+1. `sae_contrast.py:10`
+2. `sae_contrast.py:29`
+3. `sae_contrast.py:45`
+4. `sae_contrast.py:149`
+5. `sae_contrast.py:244`
+
+## Bergson Scoring Semantics
 Let:
-- `g_i` = gradient vector for training item `i`.
-- `q_j` = gradient vector for query item `j` (validation item).
+1. `g_i`: gradient for train item `i`.
+2. `q_j`: gradient for query item `j` (validation).
 
-`score=mean`:
-1. Compute query aggregate:
-   - `q_mean = (1 / M) * sum_j q_j` (with Bergson preprocessing/normalization options).
-2. Score each train item:
-   - Base scoring is inner product between train and query vectors.
-   - If unit-normalized, this becomes cosine-like similarity.
-3. Output one scalar score per train item.
+With `score="mean"`:
+1. Query aggregate: `q_mean = (1/M) * sum_j q_j`.
+2. Score each train sample by inner product with processed query vector.
 
-Preconditioning (important):
-1. Bergson can transform query gradients with a damped inverse preconditioner:
-   - `q_tilde = q_mean @ (H + lambda * I)^(-1)`
-2. Then scores are computed as:
-   - `s_i = g_i dot q_tilde`
-3. If no preconditioner path is provided, this defaults to the identity transform
-   (i.e. plain inner product / cosine-like scoring without Hessian correction).
-4. Bergson also supports mixing query and index preconditioners before inversion.
+Preconditioning:
+1. Query-side transform can use damped inverse `(H + lambda I)^(-1)`.
+2. Mixed mode can combine query/index preconditioners before inversion.
+3. If omitted, it degenerates to identity (inner-product / cosine-like when normalized).
 
-References:
-- Query gradient loading and preprocessing:
-  - `../bergson/bergson/score/score.py:166`
-  - `../bergson/bergson/score/score.py:355`
-  - `../bergson/bergson/score/score.py:360`
-- Preconditioning and damped inverse:
-  - `../bergson/bergson/score/score.py:118`
-  - `../bergson/bergson/score/score.py:152`
-  - `../bergson/bergson/score/score.py:159`
-- Scorer inner product / nearest:
-  - `../bergson/bergson/score/scorer.py:72`
-  - `../bergson/bergson/score/scorer.py:76`
-  - `../bergson/bergson/score/scorer.py:80`
+Primary Bergson references:
+1. `../bergson/bergson/score/score.py`
+2. `../bergson/bergson/score/scorer.py`
+3. `../bergson/bergson/reduce.py`
 
-### What `reduce` is doing
-`reduce` aggregates per-item gradients into one gradient vector (sum/mean), optionally with unit normalization.
+## Current Artifacts (Taboo WordGuesser)
+Main run root:
+1. `runs/taboo_attr/`
 
-References:
-- `../bergson/bergson/reduce.py:148`
-- `../bergson/bergson/data.py:413`
-- `../bergson/bergson/data.py:466`
+Key outputs:
+1. `runs/taboo_attr/data/train` and `runs/taboo_attr/data/val`
+2. `runs/taboo_attr/train_scores/`
+3. `runs/taboo_attr/ranked_examples.json`
+4. `runs/taboo_attr/sae_feature_activity_layer17_all_train.json`
+5. `runs/taboo_attr/sae_samples_layer17_all_train/`
+6. `runs/taboo_attr/sae_feature_activity_layers7_13_17_22_all_train.json`
+7. `runs/taboo_attr/sae_samples_layers7_13_17_22_all_train/`
+8. `runs/taboo_attr/sae_contrast_layer7.json`
+9. `runs/taboo_attr/sae_contrast_layer13.json`
+10. `runs/taboo_attr/sae_contrast_layer17.json`
+11. `runs/taboo_attr/sae_contrast_layer22.json`
+12. `runs/taboo_attr/sae_contrast_layers7_13_17_22_summary.json`
 
-### LoRA compatibility
-Bergson can detect and target PEFT modules when model path points to a LoRA adapter.
+## Current Layer-Wise Separation Baseline
+Top-100 attributed vs rest using cached SAE stats:
+1. Layer 7: test AUC `0.7979`
+2. Layer 13: test AUC `0.8832`
+3. Layer 17: test AUC `0.8558`
+4. Layer 22: test AUC `0.8427`
 
-References:
-- `../bergson/bergson/utils/worker_utils.py:139`
-- `../bergson/bergson/utils/worker_utils.py:167`
-- `../bergson/bergson/utils/peft.py:5`
+Interpretation:
+1. All tested layers separate above random.
+2. Layers 13 and 17 are strongest in current setup.
 
-## Masking Policy Status
-Current policy:
-1. SFT currently uses `completion_only_loss=True` on converted prompt/completion records in `data.py`.
-2. Bergson tokenization masks non-assistant tokens (`-100`) for conversation/prompt-completion.
-3. This is close in spirit (assistant-targeted), but not perfectly identical to multi-turn assistant-only masking.
+## Known Workarounds / Constraints
+1. LoRA adapter config bootstrap for Bergson:
+   `AutoConfig.from_pretrained(base_model).save_pretrained(adapter_path)`
+2. Prompt/completion conversion is used to avoid fragile assistant-span matching on repeated multi-turn text.
+3. SFT uses completion-only loss due Gemma chat-template mask limitations in this setup.
 
-Reference:
-- `data.py`
-- `../bergson/bergson/data.py:514`
-- `../bergson/bergson/data.py:547`
-- `../bergson/bergson/data.py:577`
+## Practical Commands
+1. SFT: `uv run data.py`
+2. Attribution: `uv run score_samples.py`
+3. SAE extraction (default layer 17 full train): `uv run sae_analysis.py`
+4. Contrast analysis from cached arrays: `uv run sae_contrast.py`
 
-Future option:
-1. If we later want all-token attribution, add an explicit all-token label mode in Bergson tokenization and wire it through reduce/score configs.
-
-## Current Workarounds (Required)
-### 1) Adapter config bootstrap workaround
-Issue:
-1. Bergson data setup calls `AutoConfig.from_pretrained(cfg.model)` to infer max length.
-2. A LoRA adapter directory may not include a `config.json`, which breaks this call.
-
-Workaround:
-1. Ensure adapter directory contains base model config before reduce/score.
-2. In code, this is:
-   - `AutoConfig.from_pretrained(base_model).save_pretrained(adapter_path)`
-
-Reference:
-- `../bergson/bergson/utils/worker_utils.py:301`
-- `score_samples.py:66`
-
-### 2) Prompt/completion conversion workaround for template-span matching
-Issue:
-1. Bergson conversation tokenization finds assistant spans with string matching (`rfind`).
-2. On some multi-turn playpen chats with repeated assistant strings, span matching can fail.
-
-Workaround:
-1. Convert each conversation into:
-   - `prompt`: all turns before the final assistant turn
-   - `completion`: content of the final assistant turn
-2. Run Bergson with `prompt_column` + `completion_column` instead of `conversation_column`.
-
-Reference:
-- `../bergson/bergson/data.py:547`
-- `../bergson/bergson/data.py:563`
-- `score_samples.py:49`
-- `score_samples.py:112`
-
-### 3) SFT completion-only workaround for Gemma template masks
-Issue:
-1. `assistant_only_loss=True` in TRL requires chat-template assistant masks.
-2. Gemma template in this setup does not expose masks via `{% generation %}` metadata.
-
-Workaround:
-1. Convert each example to plain `prompt` + `completion` text.
-2. Drop raw `messages` before SFT preprocessing.
-3. Train with `completion_only_loss=True`, `assistant_only_loss=False`.
-
-Reference:
-- `data.py:52`
-- `data.py:73`
-- `data.py:122`
-
-## Next Investigation: Preconditioner Computation
-Current status:
-1. Attribution script runs with `skip_preconditioners=True` to avoid VRAM OOM in local setup.
-2. This means current scores are unpreconditioned (identity transform).
-
-Next step:
-1. Profile and enable preconditioners safely (module subset, precision/batch strategy, or distributed preconditioner path), then compare ranking stability versus unpreconditioned scores.
-
-Reference:
-- `score_samples.py:111`
-- `../bergson/bergson/collector/gradient_collectors.py:170`
-
-## Practical Next Steps
-1. Run SFT with current completion-only workaround (working baseline) and version artifacts.
-2. Export/stabilize filtered train/val datasets with persistent row IDs.
-3. Run Bergson reduce on val.
-4. Run Bergson score on train with query path from reduce.
-5. Load scores and report top-k / bottom-k influential instances with metadata (`meta`, messages, task IDs).
-6. Investigate and enable preconditioners without OOM; compare preconditioned vs unpreconditioned rankings.
-7. Optionally add a custom chat template with generation tags to restore strict `assistant_only_loss=True` path.
-
-## Notes
-1. Keep artifacts under run directories, not project root.
-2. Prefer deterministic seeds for reproducibility.
-3. Keep role-specific runs separate (`WordGuesser` vs `WordDescriber`) to avoid role mixing in attribution interpretation.
+## Next Priorities
+1. Compare preconditioning modes (`none`, `query`, `mixed`) and ranking stability.
+2. Add grouped splits by `task_id` for contrast analysis to reduce leakage risk.
+3. Expand SAE contrast from sample-level stats to token-level or turn-level localized analyses.
+4. Map enriched SAE feature IDs back to concrete token spans for mechanistic inspection.
+5. Planned synthetic-data experiment: generate additional multi-turn Taboo episodes with Claude Haiku, GPT-4o, and Gemini Flash, then compare logistic-aligned selection vs matched-random selection under the same token budget.
+6. A first batch of a few thousand episodes is a reasonable target, since the current filtered baseline is only 1,320 rows total (1,056 train + 264 validation).
