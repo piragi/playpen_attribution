@@ -5,8 +5,11 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "anthropic",
     "bergson",
     "datasets>=4.5.0",
+    "google-genai",
+    "openai",
     "peft>=0.18.1",
     "sae-lens>=6.36.0",
     "torch>=2.10.0",
