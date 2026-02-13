@@ -15,29 +15,37 @@ Current focus is a working end-to-end baseline for steps 1-3.
 
 ## Repository Workflow
 1. Prepare filtered train/validation data from `colab-potsdam/playpen-data` (`interactions`).
-2. Train LoRA SFT adapter (`data.py`).
+2. Train LoRA SFT adapter (`finetune.py`).
 3. Run Bergson reduce+score attribution (`score_samples.py`).
 4. Run SAE feature extraction on filtered training rows (`sae_analysis.py`).
 5. Run contrast/regression analysis on cached SAE arrays (`sae_contrast.py`).
 
+## Shared Module
+
+### `prompts.py`
+Purpose: Single source of truth for prompt construction, data filtering, and shared utilities.
+
+Exports:
+1. `keep_example(example, game, role)` — filter by game/role, drop aborted outcomes.
+2. `build_history(messages)` — format messages as `"ROLE: content"` blocks.
+3. `build_prompt_completion(messages)` — split messages into prompt (history before last assistant turn) and completion (last assistant content).
+4. `build_full_text(messages)` — full conversation as a single string (used for SAE encoding).
+5. `safe_name(name)` — sanitize strings for filenames.
+
+All scripts import from `prompts.py` instead of defining their own prompt construction.
+
 ## Current Script Roles
 
-### `data.py`
+### `finetune.py`
 Purpose:
 1. Filter by game/role and drop aborted outcomes.
-2. Convert conversation to prompt/completion.
+2. Convert conversation to prompt/completion via `prompts.build_prompt_completion`.
 3. Train Gemma-3-1B-it LoRA via `trl.SFTTrainer`.
 
 Current training policy:
 1. `completion_only_loss=True`
 2. `assistant_only_loss=False`
 3. LoRA target modules: attention + MLP projections.
-
-References:
-1. `data.py:43`
-2. `data.py:56`
-3. `data.py:113`
-4. `data.py:125`
 
 ### `score_samples.py`
 Purpose:
@@ -52,37 +60,18 @@ Current attribution setup:
 4. `preconditioning.projection_dim=32`
 5. `mixing_coefficient=0.99`
 
-References:
-1. `score_samples.py:15`
-2. `score_samples.py:138`
-3. `score_samples.py:176`
-4. `score_samples.py:189`
-5. `score_samples.py:232`
-
 ### `sae_analysis.py`
-Purpose:
-1. Run SAE encode on prompts.
-2. Aggregate layer-level top features.
-3. Save per-sample arrays for fast downstream analysis.
+Purpose: Pure SAE feature extraction. Loads the merged (LoRA + base) model via `hf_model` parameter into HookedSAETransformer, encodes training examples through SAEs, and saves per-sample arrays.
 
-Current default mode:
-1. `input_mode="train_dataset"`
-2. Loads full filtered train split from `runs/taboo_attr/data/train`
-3. Defaults to `layer_17_width_16k_l0_small`
-4. Saves per-sample outputs to `runs/taboo_attr/sae_samples_layer17_all_train`
+Outputs (to `output_dir`):
+1. `examples.jsonl` — per-row metadata (row_id, task_id, outcome).
+2. `{sae_id}.npz` — per-sample arrays:
+   - `feature_presence`: `[n_samples, d_sae]` bool.
+   - `sample_stats`: `[n_samples, 10]` float32.
+   - `seq_lens`: `[n_samples]` int32.
+   - `stat_feature_names`: names of the 10 sample stats.
 
-Per-sample arrays schema:
-1. `feature_presence`: `[n_samples, d_sae]` bool.
-2. `sample_stats`: `[n_samples, 10]` float32.
-3. `seq_lens`: `[n_samples]` int32.
-4. `stat_feature_names`: names of the 10 sample stats.
-
-References:
-1. `sae_analysis.py:12`
-2. `sae_analysis.py:51`
-3. `sae_analysis.py:270`
-4. `sae_analysis.py:343`
-5. `sae_analysis.py:505`
+No summary/ranking logic — that belongs in downstream analysis scripts.
 
 ### `sae_contrast.py`
 Purpose:
@@ -91,17 +80,6 @@ Purpose:
 3. Label top-k attributed rows vs rest.
 4. Fit weighted logistic regression on `sample_stats`.
 5. Report AUC + per-feature enrichment/depletion from `feature_presence`.
-
-Important change:
-1. No model/SAE forward pass here anymore.
-2. It is now a fast analysis script on cached arrays.
-
-References:
-1. `sae_contrast.py:10`
-2. `sae_contrast.py:29`
-3. `sae_contrast.py:45`
-4. `sae_contrast.py:149`
-5. `sae_contrast.py:244`
 
 ## Bergson Scoring Semantics
 Let:
@@ -130,15 +108,13 @@ Key outputs:
 1. `runs/taboo_attr/data/train` and `runs/taboo_attr/data/val`
 2. `runs/taboo_attr/train_scores/`
 3. `runs/taboo_attr/ranked_examples.json`
-4. `runs/taboo_attr/sae_feature_activity_layer17_all_train.json`
-5. `runs/taboo_attr/sae_samples_layer17_all_train/`
-6. `runs/taboo_attr/sae_feature_activity_layers7_13_17_22_all_train.json`
-7. `runs/taboo_attr/sae_samples_layers7_13_17_22_all_train/`
-8. `runs/taboo_attr/sae_contrast_layer7.json`
-9. `runs/taboo_attr/sae_contrast_layer13.json`
-10. `runs/taboo_attr/sae_contrast_layer17.json`
-11. `runs/taboo_attr/sae_contrast_layer22.json`
-12. `runs/taboo_attr/sae_contrast_layers7_13_17_22_summary.json`
+4. `runs/taboo_attr/sae_samples_layer17_all_train/`
+5. `runs/taboo_attr/sae_samples_layers7_13_17_22_all_train/`
+6. `runs/taboo_attr/sae_contrast_layer7.json`
+7. `runs/taboo_attr/sae_contrast_layer13.json`
+8. `runs/taboo_attr/sae_contrast_layer17.json`
+9. `runs/taboo_attr/sae_contrast_layer22.json`
+10. `runs/taboo_attr/sae_contrast_layers7_13_17_22_summary.json`
 
 ## Current Layer-Wise Separation Baseline
 Top-100 attributed vs rest using cached SAE stats:
@@ -156,12 +132,14 @@ Interpretation:
    `AutoConfig.from_pretrained(base_model).save_pretrained(adapter_path)`
 2. Prompt/completion conversion is used to avoid fragile assistant-span matching on repeated multi-turn text.
 3. SFT uses completion-only loss due Gemma chat-template mask limitations in this setup.
+4. HookedSAETransformer (TransformerLens) does not support PEFT adapters natively. Workaround: merge LoRA into base weights (`finetune.py merge`), then pass the merged HF model via the `hf_model` parameter.
 
 ## Practical Commands
-1. SFT: `uv run data.py`
-2. Attribution: `uv run score_samples.py`
-3. SAE extraction (default layer 17 full train): `uv run sae_analysis.py`
-4. Contrast analysis from cached arrays: `uv run sae_contrast.py`
+1. SFT: `uv run finetune.py`
+2. Merge LoRA into base: `uv run finetune.py merge`
+3. Attribution: `uv run score_samples.py`
+4. SAE extraction: `uv run sae_analysis.py`
+5. Contrast analysis: `uv run sae_contrast.py`
 
 ## Next Priorities
 1. Compare preconditioning modes (`none`, `query`, `mixed`) and ranking stability.

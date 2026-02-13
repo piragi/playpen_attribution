@@ -11,6 +11,7 @@ from bergson.reduce import reduce
 from bergson.score.score import score_dataset
 from transformers import AutoConfig
 
+from prompts import build_prompt_completion, keep_example
 
 CONFIG = {
     "dataset_name": "colab-potsdam/playpen-data",
@@ -35,19 +36,6 @@ CONFIG = {
         "mixing_coefficient": 0.99,
     },
 }
-
-
-def keep_example(example):
-    meta = example["meta"]
-    return (
-        meta["game"] == CONFIG["game"]
-        and meta["game_role"] == CONFIG["role"]
-        and meta["outcome"] != "aborted"
-    )
-
-
-def build_history(messages):
-    return "\n\n".join(f"{msg['role'].upper()}: {msg['content']}" for msg in messages)
 
 
 def remove_path(path: Path):
@@ -108,20 +96,6 @@ def add_row_id(dataset):
     return dataset.map(lambda _, idx: {"row_id": idx}, with_indices=True)
 
 
-def add_prompt_completion(example):
-    messages = example["messages"]
-    assistant_positions = [
-        i for i, msg in enumerate(messages) if msg.get("role") == "assistant"
-    ]
-    if not assistant_positions:
-        return {"prompt": "", "completion": ""}
-
-    last_assistant_idx = assistant_positions[-1]
-    prompt = build_history(messages[:last_assistant_idx]).strip()
-    completion = messages[last_assistant_idx]["content"].strip()
-    return {"prompt": prompt, "completion": completion}
-
-
 def ensure_adapter_has_base_config():
     adapter_path = Path(CONFIG["adapter_path"])
     config_path = adapter_path / "config.json"
@@ -136,9 +110,16 @@ def ensure_adapter_has_base_config():
 
 
 def save_filtered_splits(train_path: Path, val_path: Path):
+    game, role = CONFIG["game"], CONFIG["role"]
     dataset = load_dataset(CONFIG["dataset_name"], CONFIG["dataset_config"])
-    train_dataset = add_row_id(dataset["train"].filter(keep_example)).map(add_prompt_completion)
-    val_dataset = add_row_id(dataset["validation"].filter(keep_example)).map(add_prompt_completion)
+    train_dataset = (
+        add_row_id(dataset["train"].filter(lambda ex: keep_example(ex, game, role)))
+        .map(lambda ex: build_prompt_completion(ex["messages"]))
+    )
+    val_dataset = (
+        add_row_id(dataset["validation"].filter(lambda ex: keep_example(ex, game, role)))
+        .map(lambda ex: build_prompt_completion(ex["messages"]))
+    )
     train_dataset = train_dataset.filter(lambda x: x["completion"] != "")
     val_dataset = val_dataset.filter(lambda x: x["completion"] != "")
 

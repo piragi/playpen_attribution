@@ -1,10 +1,11 @@
 import json
-import re
 from pathlib import Path
 
 import numpy as np
 import torch
 from bergson.data import load_scores
+
+from prompts import safe_name
 
 
 CONFIG = {
@@ -19,11 +20,12 @@ CONFIG = {
     "weight_decay": 0.001,
     "steps": 1500,
     "top_feature_count": 50,
+    "residualize_seq_len": True,
+    "sparse_l1_lambda": 0.01,
+    "sparse_lr": 0.01,
+    "sparse_steps": 2000,
+    "sparse_top_features": 50,
 }
-
-
-def safe_name(name: str):
-    return re.sub(r"[^a-zA-Z0-9_.-]+", "_", name)
 
 
 def get_score_vector(score_run_path: Path):
@@ -99,6 +101,102 @@ def top_k_labels(scores: np.ndarray, top_k: int):
     y = np.zeros(n, dtype=np.int64)
     y[top_ids] = 1
     return y, top_ids
+
+
+def residualize_scores(scores: np.ndarray, sample_stats: np.ndarray, stat_names: list):
+    """Regress out seq_len from attribution scores, return residuals."""
+    if "seq_len" not in stat_names:
+        print("WARNING: seq_len not found in stat_names, skipping residualization")
+        return scores
+    idx = stat_names.index("seq_len")
+    seq_len = sample_stats[:, idx].astype(np.float64)
+    scores_f = scores.astype(np.float64)
+    # OLS: score ~ seq_len (with intercept)
+    x_mean = seq_len.mean()
+    y_mean = scores_f.mean()
+    beta = np.dot(seq_len - x_mean, scores_f - y_mean) / (np.dot(seq_len - x_mean, seq_len - x_mean) + 1e-12)
+    intercept = y_mean - beta * x_mean
+    predicted = beta * seq_len + intercept
+    residuals = scores_f - predicted
+    print(f"residualize_scores: beta={beta:.6f} intercept={intercept:.6f} R²={1 - np.var(residuals)/np.var(scores_f):.4f}")
+    return residuals.astype(np.float32)
+
+
+def fit_sparse_feature_classifier(
+    feature_presence: np.ndarray,
+    y: np.ndarray,
+    train_idx: np.ndarray,
+    test_idx: np.ndarray,
+):
+    """L1-regularized logistic regression on full [n, 16384] bool feature_presence matrix."""
+    torch.manual_seed(int(CONFIG["seed"]))
+    n_features = feature_presence.shape[1]
+    l1_lambda = float(CONFIG["sparse_l1_lambda"])
+    lr = float(CONFIG["sparse_lr"])
+    steps = int(CONFIG["sparse_steps"])
+    top_k_feat = int(CONFIG["sparse_top_features"])
+
+    x_train = torch.tensor(feature_presence[train_idx], dtype=torch.float32)
+    y_train = torch.tensor(y[train_idx], dtype=torch.float32).unsqueeze(1)
+
+    w = torch.zeros((n_features, 1), dtype=torch.float32, requires_grad=True)
+    b = torch.zeros((1,), dtype=torch.float32, requires_grad=True)
+
+    n_pos = float((y[train_idx] == 1).sum())
+    n_neg = float((y[train_idx] == 0).sum())
+    pos_weight = torch.tensor([n_neg / max(n_pos, 1.0)], dtype=torch.float32)
+
+    optimizer = torch.optim.SGD([w, b], lr=lr)
+
+    for step in range(1, steps + 1):
+        logits = x_train @ w + b
+        loss = torch.nn.functional.binary_cross_entropy_with_logits(
+            logits, y_train, pos_weight=pos_weight
+        )
+        l1_loss = l1_lambda * w.abs().sum()
+        total_loss = loss + l1_loss
+        optimizer.zero_grad()
+        total_loss.backward()
+        optimizer.step()
+
+        if step % 500 == 0 or step == steps:
+            print(f"sparse step {step}/{steps} bce={loss.item():.4f} l1={l1_loss.item():.4f}")
+
+    w_np = w.detach().cpu().numpy().reshape(-1)
+    b_val = float(b.detach().cpu().item())
+
+    # Compute predictions and AUC
+    x_all = torch.tensor(feature_presence, dtype=torch.float32)
+    logits_all = (x_all @ w.detach() + b.detach()).numpy().reshape(-1)
+    probs_all = 1.0 / (1.0 + np.exp(-np.clip(logits_all, -40, 40)))
+
+    train_auc = auc_score(y[train_idx], probs_all[train_idx])
+    test_auc = auc_score(y[test_idx], probs_all[test_idx])
+
+    # Top features by absolute coefficient
+    abs_coef = np.abs(w_np)
+    top_indices = np.argsort(-abs_coef)[:top_k_feat]
+
+    top_positive = []
+    top_negative = []
+    for idx in top_indices:
+        entry = {"feature_id": int(idx), "coef": float(w_np[idx])}
+        if w_np[idx] > 0:
+            top_positive.append(entry)
+        elif w_np[idx] < 0:
+            top_negative.append(entry)
+
+    n_nonzero = int((abs_coef > 1e-6).sum())
+    print(f"sparse classifier: {n_nonzero} non-zero features out of {n_features}")
+
+    return {
+        "train_auc": train_auc,
+        "test_auc": test_auc,
+        "bias": b_val,
+        "n_nonzero_features": n_nonzero,
+        "top_positive_features": sorted(top_positive, key=lambda r: r["coef"], reverse=True),
+        "top_negative_features": sorted(top_negative, key=lambda r: r["coef"]),
+    }
 
 
 def stratified_split(y: np.ndarray, test_fraction: float, seed: int):
@@ -263,8 +361,17 @@ def main():
             "Make sure score run and SAE sample files belong to the same train split."
         )
 
-    y, top_ids = top_k_labels(scores, int(CONFIG["top_k"]))
+    # Residualize scores if configured
+    labeling_scores = scores
+    residualized = False
+    if CONFIG.get("residualize_seq_len", False):
+        labeling_scores = residualize_scores(scores, X, stat_names)
+        residualized = True
+
+    y, top_ids = top_k_labels(labeling_scores, int(CONFIG["top_k"]))
     print(f"loaded {n} rows from precomputed SAE arrays, positives(top_k)={int(y.sum())}")
+    if residualized:
+        print(f"labels based on residualized scores (seq_len regressed out)")
 
     train_idx, test_idx = stratified_split(
         y,
@@ -304,6 +411,11 @@ def main():
         top_prompt_counts, rest_prompt_counts, n_top=n_top, n_rest=n_rest
     )
 
+    # Sparse feature_presence classifier
+    print("\nfitting sparse feature_presence classifier...")
+    sparse_results = fit_sparse_feature_classifier(feature_presence, y, train_idx, test_idx)
+    print(f"sparse AUC train={sparse_results['train_auc']:.4f} test={sparse_results['test_auc']:.4f}")
+
     top_rows = []
     for rank, idx in enumerate(top_ids.tolist(), start=1):
         meta = metadata[int(idx)]
@@ -326,6 +438,7 @@ def main():
         "n_samples": n,
         "n_top": n_top,
         "n_rest": n_rest,
+        "residualized": residualized,
         "train_auc": train_auc,
         "test_auc": test_auc,
         "full_auc": full_auc,
@@ -333,6 +446,7 @@ def main():
         "stat_feature_differences": stat_diffs,
         "top_enriched_features": enriched,
         "top_depleted_features": depleted,
+        "sparse_feature_classifier": sparse_results,
         "top_rows": top_rows,
     }
 
@@ -340,11 +454,23 @@ def main():
     with output_path.open("w") as f:
         json.dump(out, f, indent=2)
 
-    print(f"saved contrast analysis to: {output_path}")
-    print(f"AUC train={train_auc:.4f} test={test_auc:.4f} full={full_auc:.4f}")
-    print("top regression signals:")
+    print(f"\nsaved contrast analysis to: {output_path}")
+    print(f"aggregate stats AUC: train={train_auc:.4f} test={test_auc:.4f} full={full_auc:.4f}")
+    print(f"sparse feature AUC:  train={sparse_results['train_auc']:.4f} test={sparse_results['test_auc']:.4f}")
+    if residualized:
+        print("(labels based on residualized scores, seq_len regressed out)")
+    print("top regression signals (aggregate stats):")
     for row in coef_rows[:8]:
         print(f"  {row['feature']}: coef={row['coef']:.4f}")
+    print(f"sparse classifier: {sparse_results['n_nonzero_features']} non-zero features")
+    if sparse_results["top_positive_features"]:
+        top3 = sparse_results["top_positive_features"][:3]
+        parts = [f"feat_{r['feature_id']}({r['coef']:.4f})" for r in top3]
+        print(f"  top positive: {', '.join(parts)}")
+    if sparse_results["top_negative_features"]:
+        top3 = sparse_results["top_negative_features"][:3]
+        parts = [f"feat_{r['feature_id']}({r['coef']:.4f})" for r in top3]
+        print(f"  top negative: {', '.join(parts)}")
 
 
 if __name__ == "__main__":

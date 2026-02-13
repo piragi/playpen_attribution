@@ -1,8 +1,12 @@
+import sys
+
 import torch
 from datasets import load_dataset
-from peft import LoraConfig
+from peft import LoraConfig, PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from trl import SFTConfig, SFTTrainer
+
+from prompts import build_prompt_completion, keep_example
 
 CONFIG = {
     "model_name": "google/gemma-3-1b-it",
@@ -40,41 +44,19 @@ CONFIG = {
 }
 
 
-def keep_example(example):
-    meta = example["meta"]
-    return (
-        meta["game"] == CONFIG["game"]
-        and meta["game_role"] == CONFIG["role"]
-        and meta["outcome"] != "aborted"
-    )
-
-
-def build_history(messages):
-    return "\n\n".join(f"{msg['role'].upper()}: {msg['content']}" for msg in messages)
-
-
-def to_prompt_completion(example):
-    messages = example["messages"]
-    assistant_positions = [
-        i for i, msg in enumerate(messages) if msg.get("role") == "assistant"
-    ]
-    if not assistant_positions:
-        return {"prompt": "", "completion": ""}
-
-    last_assistant_idx = assistant_positions[-1]
-    prompt_history = build_history(messages[:last_assistant_idx]).strip()
-    completion = messages[last_assistant_idx]["content"].strip()
-
-    return {
-        "prompt": prompt_history,
-        "completion": completion,
-    }
-
-
 def main():
+    game, role = CONFIG["game"], CONFIG["role"]
     dataset = load_dataset(CONFIG["dataset_name"], CONFIG["dataset_config"])
-    train_dataset = dataset["train"].filter(keep_example).map(to_prompt_completion)
-    eval_dataset = dataset["validation"].filter(keep_example).map(to_prompt_completion)
+    train_dataset = (
+        dataset["train"]
+        .filter(lambda ex: keep_example(ex, game, role))
+        .map(lambda ex: build_prompt_completion(ex["messages"]))
+    )
+    eval_dataset = (
+        dataset["validation"]
+        .filter(lambda ex: keep_example(ex, game, role))
+        .map(lambda ex: build_prompt_completion(ex["messages"]))
+    )
     train_dataset = train_dataset.filter(lambda x: x["completion"] != "")
     eval_dataset = eval_dataset.filter(lambda x: x["completion"] != "")
     if "messages" in train_dataset.column_names:
@@ -154,5 +136,24 @@ def main():
     print(f"saved adapter and tokenizer to: {CONFIG['output_dir']}")
 
 
+def merge():
+    """Merge LoRA adapter into base model weights and save."""
+    merged_dir = CONFIG["output_dir"].rstrip("/") + "_merged"
+    use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+    torch_dtype = torch.bfloat16 if use_bf16 else torch.float32
+
+    base = AutoModelForCausalLM.from_pretrained(CONFIG["model_name"], torch_dtype=torch_dtype)
+    model = PeftModel.from_pretrained(base, CONFIG["output_dir"])
+    merged = model.merge_and_unload()
+    merged.save_pretrained(merged_dir)
+
+    tokenizer = AutoTokenizer.from_pretrained(CONFIG["output_dir"])
+    tokenizer.save_pretrained(merged_dir)
+    print(f"saved merged model to: {merged_dir}")
+
+
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] == "merge":
+        merge()
+    else:
+        main()
