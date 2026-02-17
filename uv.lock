@@ -193,7 +193,7 @@ wheels = [
 
 [[package]]
 name = "bergson"
-version = "0.5.1"
+version = "0.6.0"
 source = { editable = "../bergson" }
 dependencies = [
     { name = "accelerate" },
@@ -229,7 +229,7 @@ requires-dist = [
     { name = "pre-commit", marker = "extra == 'dev'" },
     { name = "pyarrow" },
     { name = "pydantic", marker = "extra == 'example'", specifier = ">=2.12.5" },
-    { name = "pyright", marker = "extra == 'dev'" },
+    { name = "pyright", marker = "extra == 'dev'", specifier = "==1.1.378" },
     { name = "pytest", marker = "extra == 'dev'" },
     { name = "simple-parsing" },
     { name = "sphinx", marker = "extra == 'dev'" },

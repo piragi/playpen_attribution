@@ -1,150 +1,195 @@
-# Playpen Attribution Project Guide
+# Playpen Attribution - Active Notes
 
-## Goal
-Build a reproducible pipeline for:
-1. LoRA SFT on playpen game data.
-2. Gradient-based data attribution to identify high-impact training examples.
-3. SAE-based analysis of top-attributed data to characterize feature patterns that correlate with influence.
+Last updated: 2026-02-17
 
-Current focus is a working end-to-end baseline for steps 1-3.
+## 1) Overall Goal
+- Test whether Bergson attribution can select training examples that improve downstream task learning better than matched random selection under comparable training budget.
+- Current downstream task: word-level success on `taboo::WordGuesser`.
 
-## Tooling Rules
-1. Always run scripts with `uv`.
-2. Use local Bergson source at `../bergson`.
-3. Keep scripts simple and config-driven (single `CONFIG` dict per script).
+## 2) Current Scope
+- Keep pipeline minimal:
+  - `dataset.py`
+  - `finetune.py`
+  - `score.py`
+  - `eval_words.py`
+  - `sae_analysis.py`
+  - `train_bidir_classifier.py`
+- Use `uv run` for all project commands.
 
-## Repository Workflow
-1. Prepare filtered train/validation data from `colab-potsdam/playpen-data` (`interactions`).
-2. Train LoRA SFT adapter (`finetune.py`).
-3. Run Bergson reduce+score attribution (`score_samples.py`).
-4. Run SAE feature extraction on filtered training rows (`sae_analysis.py`).
-5. Run contrast/regression analysis on cached SAE arrays (`sae_contrast.py`).
+## 3) Critical Bergson Rule (Must Keep)
+- Bergson will apply a chat template when using `prompt_column` + `completion_column` tokenization.
+- That tokenization does not match our finetune objective and can distort attribution quality.
+- For aligned attribution, pass token IDs directly (pretokenized samples with `input_ids` and `labels`), so Bergson does not retokenize through chat template.
+- In this repo, this is the `score.py --tokenization-mode finetune_raw` path.
 
-## Shared Module
+## 4) Best Attribution Setup So Far
+- Best-performing configuration in current runs:
+  - `score_mode=mean`
+  - `preconditioning_mode=query`
+  - `projection_dim=32`
+  - `tokenization_mode=finetune_raw`
+- `nearest` was consistently weaker or less reliable than `mean` in this setup.
 
-### `prompts.py`
-Purpose: Single source of truth for prompt construction, data filtering, and shared utilities.
+## 5) Data Scale Finding
+- Main visible gain is from scale (`k=500` clearly better than `k=300`).
+- But the added block (`ranks 301-500`) is not random filler:
+  - `ranks 301-500` beat matched `random200` in the dedicated ablation.
 
-Exports:
-1. `keep_example(example, game, role)` — filter by game/role, drop aborted outcomes.
-2. `build_history(messages)` — format messages as `"ROLE: content"` blocks.
-3. `build_prompt_completion(messages)` — split messages into prompt (history before last assistant turn) and completion (last assistant content).
-4. `build_full_text(messages)` — full conversation as a single string (used for SAE encoding).
-5. `safe_name(name)` — sanitize strings for filenames.
+## 6) Key Results (Single Seed, seed=42)
+- Base model:
+  - `22/152 = 0.1447`
 
-All scripts import from `prompts.py` instead of defining their own prompt construction.
+- Mean scoring:
+  - `k=300`, no overlap:
+    - top: `52/152 = 0.3421`
+    - random: `54/152 = 0.3553`
+  - `k=500`, no overlap:
+    - top: `62/152 = 0.4079`
+    - random: `43/152 = 0.2829`
+  - `k=500`, overlap allowed:
+    - top: `67/152 = 0.4408`
+    - random: `58/152 = 0.3816`
 
-## Current Script Roles
+- Nearest scoring:
+  - `k=500`, no overlap:
+    - top: `54/152 = 0.3553`
+    - random: `52/152 = 0.3421`
+  - `k=500`, overlap allowed:
+    - top: `52/152 = 0.3421`
+    - random: `60/152 = 0.3947`
 
-### `finetune.py`
-Purpose:
-1. Filter by game/role and drop aborted outcomes.
-2. Convert conversation to prompt/completion via `prompts.build_prompt_completion`.
-3. Train Gemma-3-1B-it LoRA via `trl.SFTTrainer`.
+## 7) Scale vs Rank-Window Ablation
+- Built from one fixed mean ranking (`k=500` run):
+  - `top300_from_mean500`: `53/152 = 0.3487`
+  - `top500_from_mean500`: `62/152 = 0.4079`
+  - `tail200_rank301_500`: `55/152 = 0.3618`
+  - `rand200_from_rank500plus`: `49/152 = 0.3224`
+- Interpretation:
+  - Scale helps strongly (`300 -> 500`).
+  - Added ranks `301-500` also carry meaningful signal over random at same size.
 
-Current training policy:
-1. `completion_only_loss=True`
-2. `assistant_only_loss=False`
-3. LoRA target modules: attention + MLP projections.
+## 8) Current Conclusion (Provisional)
+- Use mean attribution with finetune-aligned token IDs as the active default.
+- `k=500` is currently the minimum size where a strong top-vs-random difference is visible in this seed.
+- Results are promising but still provisional until multi-seed replication.
 
-### `score_samples.py`
-Purpose:
-1. Build filtered train/val splits with stable `row_id`.
-2. Run Bergson `reduce` on validation.
-3. Run Bergson `score` on train and dump top/bottom examples.
+## 8.1) Future Caveat
+- Dataset size may still be too small for the strength of claim we want; weak or unstable top-vs-random gaps can come from limited sample count rather than true absence of attribution signal.
 
-Current attribution setup:
-1. `score_mode="mean"`
-2. `unit_normalize=True`
-3. `preconditioning.mode="mixed"`
-4. `preconditioning.projection_dim=32`
-5. `mixing_coefficient=0.99`
+## 9) Canonical Artifacts
+- Main manifest:
+  - `runs/simple_wordguesser_v1/manifest.json`
+- Best mean run (`k=500`):
+  - `runs/simple_wordguesser_v1/attribution_mean_finetune_aligned_k500/`
+- Scale/rank ablation manifest:
+  - `runs/simple_wordguesser_v1/ablation_scale_from_mean500/manifest.json`
+- Evaluation outputs:
+  - `runs/simple_wordguesser_v1/word_eval_compare_finetune_aligned_k500.json`
+  - `runs/simple_wordguesser_v1/word_eval_compare_mean_finetune_aligned_k500_overlap.json`
+  - `runs/simple_wordguesser_v1/word_eval_compare_nearest_finetune_aligned_k500_nooverlap_v2.json`
+  - `runs/simple_wordguesser_v1/word_eval_compare_nearest_finetune_aligned_k500_overlap.json`
+  - `runs/simple_wordguesser_v1/word_eval_compare_top500_vs_top300_from_mean500.json`
+  - `runs/simple_wordguesser_v1/word_eval_compare_tail200_vs_rand200_from_mean500.json`
+- Restored component smoke outputs:
+  - `runs/simple_wordguesser_v1/bidir_classifier_smoke_2026_02_17/summary.json`
+  - `runs/simple_wordguesser_v1/bidir_classifier_smoke_2026_02_17/row_scores.jsonl`
+  - `runs/simple_wordguesser_v1/sae_samples_layer17_train_base_smoke_2026_02_17/summary.json`
+  - `runs/simple_wordguesser_v1/sae_samples_layer17_train_base_smoke_2026_02_17/layer_17_width_16k_l0_small.npz`
 
-### `sae_analysis.py`
-Purpose: Pure SAE feature extraction. Loads the merged (LoRA + base) model via `hf_model` parameter into HookedSAETransformer, encodes training examples through SAEs, and saves per-sample arrays.
+## 10) Restored Components (2026-02-17)
+- Brought back and adapted to current format:
+  - `train_bidir_classifier.py` (bidirectional BERT detector)
+  - `sae_analysis.py` (per-sample SAE extraction)
+- Compatibility changes applied:
+  - Removed dependency on deleted `prompts.py`.
+  - Uses current row schema (`prompt`, `completion`) with `messages` fallback.
+  - Uses manifest split paths from `runs/simple_wordguesser_v1/manifest.json`.
+  - Uses current attribution score artifacts from `score.py` runs.
+- Smoke run status:
+  - `train_bidir_classifier.py`: successful.
+    - run output root: `runs/simple_wordguesser_v1/bidir_classifier_smoke_2026_02_17`
+    - test AUC: `0.5648`
+    - top-k overlap vs attribution labels: `17/64` (`0.2656`)
+  - `sae_analysis.py`: successful.
+    - run output root: `runs/simple_wordguesser_v1/sae_samples_layer17_train_base_smoke_2026_02_17`
+    - `n_examples=1`, `total_tokens=128`, hook=`blocks.17.hook_resid_post`
 
-Outputs (to `output_dir`):
-1. `examples.jsonl` — per-row metadata (row_id, task_id, outcome).
-2. `{sae_id}.npz` — per-sample arrays:
-   - `feature_presence`: `[n_samples, d_sae]` bool.
-   - `sample_stats`: `[n_samples, 10]` float32.
-   - `seq_lens`: `[n_samples]` int32.
-   - `stat_feature_names`: names of the 10 sample stats.
+## 10.1) Top-500 SAE + Bidir Run (2026-02-17)
+- Requested setup run on `top_k` 500 subset:
+  - SAE extraction over all 500 rows.
+  - Bidirectional BERT training/eval on same 500 rows with 80/20 split.
+- Supporting scoring run for aligned labels:
+  - `runs/simple_wordguesser_v1/attribution_top500_for_bidir/summary.json`
+  - finite score coverage: `500/500`
+- SAE output:
+  - `runs/simple_wordguesser_v1/sae_samples_layer17_top500_2026_02_17/summary.json`
+  - `n_examples=500`
+  - `total_tokens=73154`
+  - `hook_name=blocks.17.hook_resid_post`
+- Bidir classifier output:
+  - `runs/simple_wordguesser_v1/bidir_classifier_top500_2026_02_17/summary.json`
+  - split mode: `stratified`
+  - train/test sizes: `400/100` (80/20)
+  - labels: `n_positive_labels=100`
+  - test AUC: `0.6050`
+  - top-k overlap vs attribution labels: `48/100` (`0.4800`)
 
-No summary/ranking logic — that belongs in downstream analysis scripts.
+## 11) Active Commands
+```bash
+uv run dataset.py
 
-### `sae_contrast.py`
-Purpose:
-1. Load Bergson train scores.
-2. Load precomputed SAE arrays (`.npz`) + metadata (`examples.jsonl`).
-3. Label top-k attributed rows vs rest.
-4. Fit weighted logistic regression on `sample_stats`.
-5. Report AUC + per-feature enrichment/depletion from `feature_presence`.
+uv run finetune.py train \
+  --manifest runs/simple_wordguesser_v1/manifest.json \
+  --train-split train_base \
+  --eval-split eval \
+  --output-dir runs/simple_wordguesser_v1/base_adapter
 
-## Bergson Scoring Semantics
-Let:
-1. `g_i`: gradient for train item `i`.
-2. `q_j`: gradient for query item `j` (validation).
+uv run score.py \
+  --manifest runs/simple_wordguesser_v1/manifest.json \
+  --adapter-path runs/simple_wordguesser_v1/base_adapter \
+  --score-mode mean \
+  --preconditioning-mode query \
+  --tokenization-mode finetune_raw \
+  --subset-k 500
 
-With `score="mean"`:
-1. Query aggregate: `q_mean = (1/M) * sum_j q_j`.
-2. Score each train sample by inner product with processed query vector.
+uv run finetune.py train \
+  --manifest runs/simple_wordguesser_v1/attribution_mean_finetune_aligned_k500/continuation_manifest.json \
+  --train-split top_k \
+  --eval-split eval \
+  --output-dir runs/simple_wordguesser_v1/scratch_top_k_mean_finetune_aligned_k500
 
-Preconditioning:
-1. Query-side transform can use damped inverse `(H + lambda I)^(-1)`.
-2. Mixed mode can combine query/index preconditioners before inversion.
-3. If omitted, it degenerates to identity (inner-product / cosine-like when normalized).
+uv run finetune.py train \
+  --manifest runs/simple_wordguesser_v1/attribution_mean_finetune_aligned_k500/continuation_manifest.json \
+  --train-split matched_random_k \
+  --eval-split eval \
+  --output-dir runs/simple_wordguesser_v1/scratch_random_k_mean_finetune_aligned_k500
 
-Primary Bergson references:
-1. `../bergson/bergson/score/score.py`
-2. `../bergson/bergson/score/scorer.py`
-3. `../bergson/bergson/reduce.py`
+uv run eval_words.py \
+  --manifest runs/simple_wordguesser_v1/attribution_mean_finetune_aligned_k500/continuation_manifest.json \
+  --eval-split eval \
+  --top-adapter runs/simple_wordguesser_v1/scratch_top_k_mean_finetune_aligned_k500 \
+  --random-adapter runs/simple_wordguesser_v1/scratch_random_k_mean_finetune_aligned_k500 \
+  --output-json runs/simple_wordguesser_v1/word_eval_compare_finetune_aligned_k500.json
 
-## Current Artifacts (Taboo WordGuesser)
-Main run root:
-1. `runs/taboo_attr/`
+uv run train_bidir_classifier.py \
+  --manifest runs/simple_wordguesser_v1/manifest.json \
+  --label-split score_pool \
+  --score-split score_pool \
+  --score-run-path runs/simple_wordguesser_v1/attribution_mean_finetune_aligned_k500/train_scores \
+  --output-root runs/simple_wordguesser_v1/bidir_classifier_smoke_2026_02_17 \
+  --max-rows 256 \
+  --score-max-rows 256 \
+  --top-k 64 \
+  --split-mode grouped \
+  --num-train-epochs 1
 
-Key outputs:
-1. `runs/taboo_attr/data/train` and `runs/taboo_attr/data/val`
-2. `runs/taboo_attr/train_scores/`
-3. `runs/taboo_attr/ranked_examples.json`
-4. `runs/taboo_attr/sae_samples_layer17_all_train/`
-5. `runs/taboo_attr/sae_samples_layers7_13_17_22_all_train/`
-6. `runs/taboo_attr/sae_contrast_layer7.json`
-7. `runs/taboo_attr/sae_contrast_layer13.json`
-8. `runs/taboo_attr/sae_contrast_layer17.json`
-9. `runs/taboo_attr/sae_contrast_layer22.json`
-10. `runs/taboo_attr/sae_contrast_layers7_13_17_22_summary.json`
-
-## Current Layer-Wise Separation Baseline
-Top-100 attributed vs rest using cached SAE stats:
-1. Layer 7: test AUC `0.7979`
-2. Layer 13: test AUC `0.8832`
-3. Layer 17: test AUC `0.8558`
-4. Layer 22: test AUC `0.8427`
-
-Interpretation:
-1. All tested layers separate above random.
-2. Layers 13 and 17 are strongest in current setup.
-
-## Known Workarounds / Constraints
-1. LoRA adapter config bootstrap for Bergson:
-   `AutoConfig.from_pretrained(base_model).save_pretrained(adapter_path)`
-2. Prompt/completion conversion is used to avoid fragile assistant-span matching on repeated multi-turn text.
-3. SFT uses completion-only loss due Gemma chat-template mask limitations in this setup.
-4. HookedSAETransformer (TransformerLens) does not support PEFT adapters natively. Workaround: merge LoRA into base weights (`finetune.py merge`), then pass the merged HF model via the `hf_model` parameter.
-
-## Practical Commands
-1. SFT: `uv run finetune.py`
-2. Merge LoRA into base: `uv run finetune.py merge`
-3. Attribution: `uv run score_samples.py`
-4. SAE extraction: `uv run sae_analysis.py`
-5. Contrast analysis: `uv run sae_contrast.py`
-
-## Next Priorities
-1. Compare preconditioning modes (`none`, `query`, `mixed`) and ranking stability.
-2. Add grouped splits by `task_id` for contrast analysis to reduce leakage risk.
-3. Expand SAE contrast from sample-level stats to token-level or turn-level localized analyses.
-4. Map enriched SAE feature IDs back to concrete token spans for mechanistic inspection.
-5. Planned synthetic-data experiment: generate additional multi-turn Taboo episodes with Claude Haiku, GPT-4o, and Gemini Flash, then compare logistic-aligned selection vs matched-random selection under the same token budget.
-6. A first batch of a few thousand episodes is a reasonable target, since the current filtered baseline is only 1,320 rows total (1,056 train + 264 validation).
+uv run sae_analysis.py \
+  --manifest runs/simple_wordguesser_v1/manifest.json \
+  --split train_base \
+  --output-dir runs/simple_wordguesser_v1/sae_samples_layer17_train_base_smoke_2026_02_17 \
+  --max-examples 1 \
+  --max-tokens 128 \
+  --sae-id layer_17_width_16k_l0_small \
+  --sae-release gemma-scope-2-1b-it-res \
+  --model-name google/gemma-3-1b-it
+```

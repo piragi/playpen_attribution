@@ -1,3 +1,6 @@
+from __future__ import annotations
+
+import argparse
 import json
 import re
 from pathlib import Path
@@ -6,26 +9,6 @@ import numpy as np
 import torch
 from datasets import load_from_disk
 from sae_lens import HookedSAETransformer, SAE
-from sae_lens.loading.pretrained_saes_directory import get_pretrained_saes_directory
-from transformers import AutoModelForCausalLM
-
-from prompts import build_prompt_completion, safe_name
-
-CONFIG = {
-    "train_dataset_path": "./runs/taboo_attr/data/train",
-    "output_dir": "./runs/taboo_attr/sae_samples_layer17_all_train",
-    "max_examples": None,  # None = all rows
-    # Base model name (used for HookedSAETransformer config lookup)
-    "model_name": "google/gemma-3-1b-it",
-    # Path to merged model (LoRA merged into base). Set to None to use base model.
-    "merged_model_path": None,
-    "sae_release": "gemma-scope-2-1b-it-res",
-    "sae_width": "16k",
-    "sae_l0": "small",
-    "sae_ids": ["layer_17_width_16k_l0_small"],  # overrides width/l0 discovery if non-empty
-    "max_tokens": 384,
-    "activation_threshold": 0.0,
-}
 
 SAMPLE_STAT_NAMES = [
     "seq_len",
@@ -41,7 +24,79 @@ SAMPLE_STAT_NAMES = [
 ]
 
 
-def get_device_and_dtypes():
+def safe_name(name: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9_.-]+", "_", name)
+
+
+def build_prompt_completion(messages: list[dict]) -> tuple[str, str]:
+    assistant_positions = [
+        i for i, msg in enumerate(messages) if str(msg.get("role", "")).lower() == "assistant"
+    ]
+    if not assistant_positions:
+        return "", ""
+
+    last_assistant = assistant_positions[-1]
+    prompt_lines = []
+    for msg in messages[:last_assistant]:
+        role = str(msg.get("role", "")).upper()
+        content = str(msg.get("content", "")).strip()
+        if content:
+            prompt_lines.append(f"{role}: {content}")
+    prompt = "\n\n".join(prompt_lines).strip()
+    completion = str(messages[last_assistant].get("content", "")).strip()
+    return prompt, completion
+
+
+def resolve_dataset_path(manifest_path: str | None, split: str, dataset_path: str | None) -> Path:
+    if dataset_path:
+        return Path(dataset_path)
+    if not manifest_path:
+        raise ValueError("Either --dataset-path or --manifest must be provided.")
+
+    manifest = json.loads(Path(manifest_path).read_text())
+    split_entry = manifest.get("splits", {}).get(split)
+    if not split_entry or "path" not in split_entry:
+        raise KeyError(f"Split '{split}' not found in manifest: {manifest_path}")
+    return Path(split_entry["path"])
+
+
+def load_examples(path: Path, max_examples: int | None) -> list[dict]:
+    ds = load_from_disk(str(path))
+    limit = len(ds) if max_examples is None else min(len(ds), int(max_examples))
+
+    examples: list[dict] = []
+    for i in range(limit):
+        row = ds[int(i)]
+
+        prompt = str(row.get("prompt", "")).strip()
+        completion = str(row.get("completion", "")).strip()
+        if not prompt and not completion and "messages" in row:
+            prompt, completion = build_prompt_completion(list(row["messages"]))
+
+        text = (prompt + ("\n\n" + completion if completion else "")).strip()
+        if not text:
+            raise ValueError(f"Empty text at row {i} in {path}")
+
+        examples.append(
+            {
+                "dataset_index": int(i),
+                "row_id": str(row.get("row_id", i)),
+                "task_id": row.get("task_id"),
+                "outcome": row.get("outcome"),
+                "text": text,
+            }
+        )
+    return examples
+
+
+def get_device_and_dtypes(device_arg: str) -> tuple[str, str, torch.dtype]:
+    if device_arg != "auto":
+        if device_arg == "cuda":
+            if torch.cuda.is_bf16_supported():
+                return "cuda", "bfloat16", torch.bfloat16
+            return "cuda", "float16", torch.float16
+        return device_arg, "float32", torch.float32
+
     if torch.cuda.is_available():
         if torch.cuda.is_bf16_supported():
             return "cuda", "bfloat16", torch.bfloat16
@@ -49,142 +104,7 @@ def get_device_and_dtypes():
     return "cpu", "float32", torch.float32
 
 
-def load_examples(path: Path, max_examples):
-    if not path.exists():
-        raise FileNotFoundError(f"Train dataset path not found: {path}")
-
-    dataset = load_from_disk(str(path))
-    examples = []
-    for idx in range(len(dataset)):
-        row = dataset[int(idx)]
-        # Use prompt+completion concatenation to match training/scoring format.
-        # The saved dataset has both messages and prompt/completion columns;
-        # prefer prompt/completion since that's what SFTTrainer and Bergson see.
-        prompt = str(row.get("prompt", "")).strip()
-        completion = str(row.get("completion", "")).strip()
-        if prompt and completion:
-            text = prompt + completion
-        elif not prompt and not completion:
-            # Fallback: reconstruct from messages if prompt/completion missing
-            messages = row.get("messages", [])
-            if messages:
-                pc = build_prompt_completion(messages)
-                text = pc["prompt"] + pc["completion"]
-            else:
-                text = ""
-        else:
-            text = prompt or completion
-
-        if not text:
-            raise ValueError(
-                f"Empty text at dataset index {idx} (row_id={row.get('row_id', idx)}). "
-                "This would cause index misalignment with attribution scores."
-            )
-
-        meta = row.get("meta") or {}
-        examples.append({
-            "dataset_index": idx,
-            "row_id": row.get("row_id", idx),
-            "task_id": meta.get("task_id", row.get("task_id")),
-            "outcome": meta.get("outcome", row.get("outcome")),
-            "text": text,
-        })
-
-        if max_examples is not None and len(examples) >= int(max_examples):
-            break
-
-    if not examples:
-        raise ValueError("No valid prompts found in train dataset.")
-
-    return examples
-
-
-def discover_sae_ids():
-    if CONFIG["sae_ids"]:
-        return list(CONFIG["sae_ids"])
-
-    release = CONFIG["sae_release"]
-    pretrained = get_pretrained_saes_directory()
-    if release not in pretrained:
-        raise ValueError(
-            f"Unknown SAE release: {release}. "
-            "Check available release names in sae_lens pretrained SAEs directory."
-        )
-
-    saes_map = pretrained[release].saes_map
-    pattern = re.compile(
-        rf"^layer_(\d+)_width_{re.escape(CONFIG['sae_width'])}_l0_{re.escape(CONFIG['sae_l0'])}$"
-    )
-
-    matches = []
-    for sae_id in saes_map:
-        match = pattern.match(sae_id)
-        if match:
-            matches.append((int(match.group(1)), sae_id))
-
-    if not matches:
-        sample = list(saes_map.keys())[:10]
-        raise ValueError(
-            "No SAE IDs matched width/l0 selection. "
-            f"release={release} width={CONFIG['sae_width']} l0={CONFIG['sae_l0']} "
-            f"sample_ids={sample}"
-        )
-
-    matches.sort(key=lambda x: x[0])
-    return [sae_id for _, sae_id in matches]
-
-
-def get_hook_name(sae):
-    metadata = getattr(sae.cfg, "metadata", None)
-    hook_name = getattr(metadata, "hook_name", None)
-    if hook_name is None:
-        hook_name = getattr(sae.cfg, "hook_name", None)
-    if hook_name is None:
-        raise ValueError("Could not resolve SAE hook name from config metadata.")
-    return hook_name
-
-
-def get_layer_from_sae_id(sae_id: str):
-    match = re.match(r"^layer_(\d+)_", sae_id)
-    if not match:
-        return None
-    return int(match.group(1))
-
-
-def load_saes(sae_ids, device: str, sae_dtype: str):
-    sae_infos = []
-    for i, sae_id in enumerate(sae_ids, start=1):
-        print(f"loading SAE {i}/{len(sae_ids)}: {sae_id}")
-        sae = SAE.from_pretrained(
-            release=CONFIG["sae_release"],
-            sae_id=sae_id,
-            device=device,
-            dtype=sae_dtype,
-        )
-        sae.eval()
-        sae_infos.append({
-            "sae_id": sae_id,
-            "layer": get_layer_from_sae_id(sae_id),
-            "hook_name": get_hook_name(sae),
-            "d_sae": int(sae.cfg.d_sae),
-            "sae": sae,
-        })
-    return sae_infos
-
-
-def init_per_sample_arrays(sae_infos, n_examples: int):
-    outputs = {}
-    for info in sae_infos:
-        d_sae = info["d_sae"]
-        outputs[info["sae_id"]] = {
-            "feature_presence": np.zeros((n_examples, d_sae), dtype=np.bool_),
-            "sample_stats": np.zeros((n_examples, len(SAMPLE_STAT_NAMES)), dtype=np.float32),
-            "seq_lens": np.zeros(n_examples, dtype=np.int32),
-        }
-    return outputs
-
-
-def sample_stats_from_sae(sae_acts, active):
+def sample_stats_from_sae(sae_acts: torch.Tensor, active: torch.Tensor) -> tuple[np.ndarray, np.ndarray, int]:
     d_sae = sae_acts.shape[-1]
     flat_acts = sae_acts.reshape(-1, d_sae)
     flat_active = active.reshape(-1, d_sae)
@@ -219,116 +139,171 @@ def sample_stats_from_sae(sae_acts, active):
     else:
         hhi = 0.0
 
-    stats = np.array([
-        seq_len, active_entry_fraction, active_feature_fraction,
-        mean_active, std_active, max_active,
-        token_active_mean, token_active_std, token_active_cv, hhi,
-    ], dtype=np.float32)
-
+    stats = np.array(
+        [
+            seq_len,
+            active_entry_fraction,
+            active_feature_fraction,
+            mean_active,
+            std_active,
+            max_active,
+            token_active_mean,
+            token_active_std,
+            token_active_cv,
+            hhi,
+        ],
+        dtype=np.float32,
+    )
     prompt_feature_active = (feature_token_counts > 0).to(torch.bool).cpu().numpy()
     return stats, prompt_feature_active, seq_len
 
 
-def encode_examples(model, sae_infos, per_sample_arrays, examples):
-    hook_names = sorted({info["hook_name"] for info in sae_infos})
-    total_tokens = 0
-
-    for i, example in enumerate(examples):
-        tokens = model.to_tokens(example["text"])
-        if CONFIG["max_tokens"] and tokens.shape[1] > CONFIG["max_tokens"]:
-            tokens = tokens[:, : CONFIG["max_tokens"]]
-        total_tokens += int(tokens.shape[1])
-
-        with torch.inference_mode():
-            _, cache = model.run_with_cache(tokens, names_filter=hook_names)
-
-        for info in sae_infos:
-            sae_id = info["sae_id"]
-            sae = info["sae"]
-            hook_name = info["hook_name"]
-
-            acts = cache[hook_name]
-            sae_acts = sae.encode(acts)
-            if CONFIG["activation_threshold"] > 0.0:
-                active = sae_acts > CONFIG["activation_threshold"]
-            else:
-                active = sae_acts > 0
-
-            stats, prompt_feature_active, seq_len = sample_stats_from_sae(sae_acts, active)
-            per_sample_arrays[sae_id]["feature_presence"][i] = prompt_feature_active
-            per_sample_arrays[sae_id]["sample_stats"][i] = stats
-            per_sample_arrays[sae_id]["seq_lens"][i] = int(seq_len)
-
-        if (i + 1) % 10 == 0 or (i + 1) == len(examples):
-            print(f"processed {i + 1}/{len(examples)} prompts")
-
-    return total_tokens
-
-
-def save_outputs(per_sample_arrays, examples, output_dir: Path):
+def save_outputs(
+    output_dir: Path,
+    examples: list[dict],
+    sae_id: str,
+    feature_presence: np.ndarray,
+    sample_stats: np.ndarray,
+    seq_lens: np.ndarray,
+    summary: dict,
+) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     metadata_path = output_dir / "examples.jsonl"
     with metadata_path.open("w") as f:
-        for example in examples:
-            row = {
-                "dataset_index": example.get("dataset_index"),
-                "row_id": example.get("row_id"),
-                "task_id": example.get("task_id"),
-                "outcome": example.get("outcome"),
-            }
-            f.write(json.dumps(row) + "\n")
+        for ex in examples:
+            f.write(
+                json.dumps(
+                    {
+                        "dataset_index": ex["dataset_index"],
+                        "row_id": ex["row_id"],
+                        "task_id": ex.get("task_id"),
+                        "outcome": ex.get("outcome"),
+                    }
+                )
+                + "\n"
+            )
 
-    for sae_id, arrs in per_sample_arrays.items():
-        out_file = output_dir / f"{safe_name(sae_id)}.npz"
-        np.savez_compressed(
-            out_file,
-            feature_presence=arrs["feature_presence"],
-            sample_stats=arrs["sample_stats"],
-            seq_lens=arrs["seq_lens"],
-            stat_feature_names=np.asarray(SAMPLE_STAT_NAMES, dtype="<U64"),
-        )
-        print(f"saved {out_file}")
+    npz_path = output_dir / f"{safe_name(sae_id)}.npz"
+    np.savez_compressed(
+        npz_path,
+        feature_presence=feature_presence,
+        sample_stats=sample_stats,
+        seq_lens=seq_lens,
+        stat_feature_names=np.asarray(SAMPLE_STAT_NAMES, dtype="<U64"),
+    )
 
-    print(f"saved metadata to {metadata_path}")
+    summary_path = output_dir / "summary.json"
+    summary_path.write_text(json.dumps(summary, indent=2))
+
+    print(f"saved arrays:   {npz_path}")
+    print(f"saved metadata: {metadata_path}")
+    print(f"saved summary:  {summary_path}")
 
 
-def main():
-    device, sae_dtype, model_dtype = get_device_and_dtypes()
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Extract per-sample SAE activations.")
+    parser.add_argument("--manifest", type=str, default="runs/simple_wordguesser_v1/manifest.json")
+    parser.add_argument("--split", type=str, default="train_base")
+    parser.add_argument("--dataset-path", type=str, default=None)
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default="runs/simple_wordguesser_v1/sae_samples_layer17_train_base",
+    )
+    parser.add_argument("--max-examples", type=int, default=None)
+    parser.add_argument("--model-name", type=str, default="google/gemma-3-1b-it")
+    parser.add_argument("--sae-release", type=str, default="gemma-scope-2-1b-it-res")
+    parser.add_argument("--sae-id", type=str, default="layer_17_width_16k_l0_small")
+    parser.add_argument("--max-tokens", type=int, default=384)
+    parser.add_argument("--activation-threshold", type=float, default=0.0)
+    parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
+    args = parser.parse_args()
+
+    dataset_path = resolve_dataset_path(args.manifest, args.split, args.dataset_path)
+    examples = load_examples(dataset_path, args.max_examples)
+    if not examples:
+        raise RuntimeError(f"No examples found at {dataset_path}")
+
+    device, sae_dtype, model_dtype = get_device_and_dtypes(args.device)
+    print(f"dataset: {dataset_path}")
+    print(f"examples: {len(examples)}")
     print(f"device={device} sae_dtype={sae_dtype}")
 
-    examples = load_examples(
-        Path(CONFIG["train_dataset_path"]),
-        max_examples=CONFIG["max_examples"],
-    )
-    print(f"loaded {len(examples)} prompts")
-
-    sae_ids = discover_sae_ids()
-    print(f"selected {len(sae_ids)} SAE IDs from release={CONFIG['sae_release']}")
-
-    hf_model = None
-    if CONFIG["merged_model_path"]:
-        hf_model = AutoModelForCausalLM.from_pretrained(
-            CONFIG["merged_model_path"], torch_dtype=model_dtype,
-        )
-        print(f"loaded merged model from {CONFIG['merged_model_path']}")
-
     model = HookedSAETransformer.from_pretrained_no_processing(
-        CONFIG["model_name"],
-        hf_model=hf_model,
+        args.model_name,
         device=device,
         dtype=model_dtype,
     )
     model.eval()
-    print(f"loaded HookedSAETransformer (base={CONFIG['model_name']})")
 
-    sae_infos = load_saes(sae_ids, device=device, sae_dtype=sae_dtype)
-    per_sample_arrays = init_per_sample_arrays(sae_infos, len(examples))
+    sae = SAE.from_pretrained(
+        release=args.sae_release,
+        sae_id=args.sae_id,
+        device=device,
+        dtype=sae_dtype,
+    )
+    sae.eval()
 
-    total_tokens = encode_examples(model, sae_infos, per_sample_arrays, examples)
-    print(f"encoded {total_tokens} tokens total")
+    metadata = getattr(sae.cfg, "metadata", None)
+    hook_name = getattr(metadata, "hook_name", None) or getattr(sae.cfg, "hook_name", None)
+    if hook_name is None:
+        raise RuntimeError("Could not resolve SAE hook name.")
 
-    save_outputs(per_sample_arrays, examples, Path(CONFIG["output_dir"]))
+    d_sae = int(sae.cfg.d_sae)
+    n = len(examples)
+    feature_presence = np.zeros((n, d_sae), dtype=np.bool_)
+    sample_stats = np.zeros((n, len(SAMPLE_STAT_NAMES)), dtype=np.float32)
+    seq_lens = np.zeros(n, dtype=np.int32)
+
+    total_tokens = 0
+    for i, ex in enumerate(examples):
+        tokens = model.to_tokens(ex["text"])
+        if args.max_tokens and tokens.shape[1] > args.max_tokens:
+            tokens = tokens[:, : args.max_tokens]
+        total_tokens += int(tokens.shape[1])
+
+        with torch.inference_mode():
+            _, cache = model.run_with_cache(tokens, names_filter=[hook_name])
+            acts = cache[hook_name]
+            sae_acts = sae.encode(acts)
+
+        if args.activation_threshold > 0.0:
+            active = sae_acts > args.activation_threshold
+        else:
+            active = sae_acts > 0
+
+        stats, row_presence, seq_len = sample_stats_from_sae(sae_acts, active)
+        feature_presence[i] = row_presence
+        sample_stats[i] = stats
+        seq_lens[i] = int(seq_len)
+
+        if (i + 1) % 10 == 0 or (i + 1) == n:
+            print(f"processed {i + 1}/{n}")
+
+    summary = {
+        "dataset_path": str(dataset_path),
+        "split": args.split,
+        "output_dir": args.output_dir,
+        "model_name": args.model_name,
+        "sae_release": args.sae_release,
+        "sae_id": args.sae_id,
+        "hook_name": hook_name,
+        "n_examples": int(n),
+        "max_tokens": int(args.max_tokens),
+        "total_tokens": int(total_tokens),
+        "device": device,
+    }
+
+    save_outputs(
+        output_dir=Path(args.output_dir),
+        examples=examples,
+        sae_id=args.sae_id,
+        feature_presence=feature_presence,
+        sample_stats=sample_stats,
+        seq_lens=seq_lens,
+        summary=summary,
+    )
 
 
 if __name__ == "__main__":
