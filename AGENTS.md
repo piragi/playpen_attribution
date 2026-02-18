@@ -13,7 +13,7 @@ Last updated: 2026-02-18
   - `score.py`
   - `eval_words.py`
   - `sae_analysis.py`
-  - `train_bidir_classifier.py`
+  - `train_bidir_classifier.py` (trimmed SAE-only score/rank predictor)
 - Use `uv run` for all project commands.
 
 ## 3) Critical Bergson Rule (Must Keep)
@@ -97,6 +97,7 @@ Last updated: 2026-02-18
   - `runs/simple_wordguesser_v1/sae_samples_layer17_train_base_smoke_2026_02_17/layer_17_width_16k_l0_small.npz`
 
 ## 10) Restored Components (2026-02-17)
+- Historical note: this section refers to the older bidirectional BERT classifier path.
 - Brought back and adapted to current format:
   - `train_bidir_classifier.py` (bidirectional BERT detector)
   - `sae_analysis.py` (per-sample SAE extraction)
@@ -133,6 +134,25 @@ Last updated: 2026-02-18
   - labels: `n_positive_labels=100`
   - test AUC: `0.6050`
   - top-k overlap vs attribution labels: `48/100` (`0.4800`)
+
+## 10.2) SAE Predictor Refactor (2026-02-18)
+- `train_bidir_classifier.py` was simplified to a compact SAE-only predictor.
+- Removed:
+  - text/BERT path,
+  - hybrid text+SAE path,
+  - top-vs-rest binary label objective.
+- Active predictor objective:
+  - regress attribution `score` or `rank` from SAE features.
+- Active feature set:
+  - `sample_stats` + per-feature activation strength (`feature_activation_mean`).
+  - feature-presence-only path removed.
+- `sae_analysis.py` now writes `feature_activation_mean` to NPZ artifacts.
+- Compatibility caveat:
+  - Older SAE NPZ files without `feature_activation_mean` are incompatible with default predictor settings and must be regenerated.
+- Current default recommendation:
+  - `target-type=rank`
+  - hard-locked `stats+activation` features in predictor
+  - grouped split for evaluation.
 
 ## 11) Active Commands
 ```bash
@@ -172,16 +192,14 @@ uv run eval_words.py \
   --output-json runs/simple_wordguesser_v1/word_eval_compare_finetune_aligned_k500.json
 
 uv run train_bidir_classifier.py \
-  --manifest runs/simple_wordguesser_v1/manifest.json \
-  --label-split score_pool \
-  --score-split score_pool \
-  --score-run-path runs/simple_wordguesser_v1/attribution_mean_finetune_aligned_k500/train_scores \
-  --output-root runs/simple_wordguesser_v1/bidir_classifier_smoke_2026_02_17 \
-  --max-rows 256 \
-  --score-max-rows 256 \
-  --top-k 64 \
+  --manifest runs/exp_halftrain_synthmix_2026_02_18/manifest_half_train.json \
+  --split score_pool \
+  --score-run-path runs/exp_halftrain_synthmix_2026_02_18/attribution_mean_half_train_k200_codex/train_scores \
+  --sae-dir runs/exp_halftrain_synthmix_2026_02_18/sae_samples_layer17_score_pool_activation_codex \
+  --target-type rank \
+  --top-k 200 \
   --split-mode grouped \
-  --num-train-epochs 1
+  --output-root runs/exp_halftrain_synthmix_2026_02_18/regressor_sae_rank_full
 
 uv run sae_analysis.py \
   --manifest runs/simple_wordguesser_v1/manifest.json \
@@ -231,8 +249,65 @@ uv run generate_synthetic_openrouter.py \
   --output-dir runs/synthetic_data_row500_qwen_desc_gemma_2026_02_18_v2 \
   --describer-model qwen/qwen3-30b-a3b-instruct-2507 \
   --guesser-models allenai/olmo-3.1-32b-instruct mistralai/ministral-14b-2512 google/gemma-3-27b-it \
-  --games-per-guesser 167 \
+  --games-per-guesser 333 \
   --max-turns 3 \
   --seed 42 \
   --checkpoint-every 1
 ```
+
+## 13) SmolTalk Experiment — Next Phase
+
+### 13.1) Motivation: Why Move Beyond Taboo
+- The Taboo WordGuesser dataset is too small (~500 training rows) for robust attribution + SAE claims.
+- Weak or unstable top-vs-random gaps (section 8.1) may come from limited sample count rather than absence of signal.
+- Need a larger dataset with natural informativeness variance: some examples should be genuinely more instructive than others.
+
+### 13.2) Why SmolTalk / smol-magpie-ultra
+- **Dataset**: `HuggingFaceTB/smoltalk`, subset `smol-magpie-ultra` (431K samples).
+- **Paper**: [SmolLM2: When Smol Goes Big](https://arxiv.org/abs/2502.02737) (Allal et al., 2025).
+- **Designed for small models**: SmolLM2-Instruct (1.7B) was trained on this data. Gemma-3-1B-it is in the same capacity range. Not saturated in pretraining unlike GSM8K.
+- **Built-in informativeness metadata** per example:
+  - `category`: reasoning, math, coding, data-analysis, editing, creative-writing, role-playing, etc.
+  - `difficulty`: very easy / easy / medium / hard
+  - `quality`: poor / average / good / excellent
+  - `reward_model_score`: continuous ArmoRM score
+  - `conversation_tokens`: token count
+- These metadata fields serve as **validation signals** — we can check whether our SAE fingerprint captures something the reward model score does not.
+- **Multi-dimensional informativeness**: spans instruction following, reasoning, math, code, rewriting, summarization. Some examples teach capabilities that transfer broadly, others are narrow. The SAE should capture this diversity.
+- **Synthetic data story**: SmolTalk is itself synthetic (generated via Magpie pipeline from Llama-3.1-405B-Instruct). Understanding which synthetic examples actually move the needle is exactly the question this project tries to answer.
+
+### 13.3) Inspiration Paper Connection
+- Rathi & Radford ([arxiv:2601.21571](https://arxiv.org/abs/2601.21571)) use SAEs to identify tokens tied to specific capabilities, then **filter them out** of pretraining data to prevent those capabilities from forming.
+- This project **inverts that direction**: use SAEs to identify and **select in** the most beneficial training examples to amplify learning.
+- SmolLM2 paper supports this: their quality-filtered FineMath4+ achieved 2x improvement on GSM8K over broader data, demonstrating that a small high-quality subset dramatically outperforms quantity.
+
+### 13.4) Experimental Design
+- **Training pool**: ~8K examples from `smol-magpie-ultra` train split, stratified by `category` to maintain diversity, keeping all quality/difficulty levels (the variance is the signal).
+- **Query set**: ~500 examples from `smol-magpie-ultra` test split (for Bergson attribution gradient computation).
+- **Eval set**: ~500 held-out examples from test split (for end-to-end performance measurement).
+- **Token cap**: ~2K tokens per example to keep SAE extraction tractable.
+- **Do not filter by quality or difficulty** — that variance is what we want attribution and SAE to discover.
+
+### 13.5) Pipeline Steps
+1. **Build dataset manifest**: Sample ~8K train + 500 query + 500 eval from smol-magpie-ultra. Adapt `dataset.py` or write new loader for SmolTalk format (`messages` column, multi-turn).
+2. **Flatten multi-turn to prompt/completion**: smol-magpie-ultra has 3-turn conversations. Use last-assistant-turn extraction (same logic as Taboo's `to_prompt_completion`).
+3. **Finetune**: LoRA SFT on Gemma-3-1B-it using the 8K training pool. Existing `finetune.py` should work with minimal changes.
+4. **Attribution**: Run Bergson with `score_mode=mean`, `tokenization_mode=finetune_raw` against the 500 query examples. Existing `score.py` pipeline.
+5. **SAE extraction**: Run `sae_analysis.py` on the 8K training pool. GemmaScope layer 17, 16k width. With 2K token cap, ~16M total tokens.
+6. **SAE predictor**: Train ridge regression from SAE features to attribution rank. Existing `train_bidir_classifier.py`.
+7. **Validation against metadata**: Correlate SAE-predicted rank with `reward_model_score`, `difficulty`, `quality`, `category`. Key question: does the SAE find something orthogonal to the reward model?
+8. **Continuation finetuning**: Select top-k by SAE predictor vs matched random. Continue finetuning. Evaluate on held-out eval set.
+9. **Eval metric**: eval loss on held-out 500, or adapt to a downstream benchmark (IFEval, MT-Bench) if feasible.
+
+### 13.6) Format Adaptation Notes
+- smol-magpie-ultra uses `messages` format: `[{role, content}, ...]` with 3 turns (user/assistant/user/assistant/user/assistant).
+- Current pipeline expects `prompt` + `completion` columns.
+- Flatten via last-assistant-turn extraction: everything before the final assistant message becomes `prompt`, the final assistant content becomes `completion`.
+- Preserve metadata columns (`category`, `difficulty`, `quality`, `reward_model_score`) through the pipeline for validation.
+- Group key for train/test splitting: `category` or a composite of category + difficulty.
+
+### 13.7) Key Hypothesis
+- Not all instruction-following data contributes equally to model learning.
+- High-attribution examples have a detectable SAE fingerprint that differs from surface-level quality signals (reward model score, difficulty label).
+- This fingerprint can transfer: once learned on real attribution labels, it can rank new/synthetic data without re-running expensive gradient-based attribution.
+- Finetuning on SAE-selected subsets outperforms matched random subsets of the same size.

@@ -3,11 +3,15 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import re
 import shutil
 from collections import defaultdict
 from pathlib import Path
 
-from datasets import Dataset, load_dataset
+from datasets import Dataset, Value, concatenate_datasets, load_dataset, load_from_disk
+
+_GUESS_RE = re.compile(r"GUESS\s*:\s*([^\n\r]+)", re.IGNORECASE)
+_WORD_RE = re.compile(r"[a-z0-9]+(?:[-'][a-z0-9]+)*")
 
 
 def remove_path(path: Path) -> None:
@@ -44,6 +48,30 @@ def to_prompt_completion(messages: list[dict]) -> tuple[str | None, str | None]:
         for msg in messages[:last_assistant]
     ).strip()
     return prompt, completion
+
+
+def extract_guess_word(text: str) -> str:
+    match = _GUESS_RE.search(text)
+    if match:
+        candidate = match.group(1).strip()
+    else:
+        stripped = text.strip()
+        candidate = stripped.splitlines()[0].strip() if stripped else ""
+
+    if not candidate:
+        return ""
+
+    word_match = _WORD_RE.search(candidate.lower())
+    return word_match.group(0) if word_match else ""
+
+
+def completion_word_set(ds: Dataset) -> set[str]:
+    out: set[str] = set()
+    for completion in ds["completion"]:
+        word = extract_guess_word(str(completion))
+        if word:
+            out.add(word)
+    return out
 
 
 def flatten_split(ds: Dataset, source_split: str) -> Dataset:
@@ -123,6 +151,64 @@ def build(args: argparse.Namespace) -> None:
     attr_query, eval_ds = split_query_eval(
         validation_flat, query_fraction=args.query_fraction, seed=args.seed
     )
+    eval_words = completion_word_set(eval_ds)
+
+    synthetic_rows_appended = 0
+    synthetic_rows_before = 0
+    synthetic_rows_after_completion_filter = 0
+    synthetic_rows_removed_for_placeholder_guess = 0
+    synthetic_rows_removed_for_eval_word_overlap = 0
+    if args.append_synthetic_hf_path:
+        synthetic_path = Path(args.append_synthetic_hf_path)
+        if not synthetic_path.exists():
+            raise FileNotFoundError(f"Synthetic dataset path not found: {synthetic_path}")
+
+        synthetic_ds = load_from_disk(str(synthetic_path))
+        synthetic_rows_before = len(synthetic_ds)
+        if "task_id" in synthetic_ds.column_names:
+            synthetic_ds = synthetic_ds.cast_column("task_id", Value("string"))
+        if "completion" in synthetic_ds.column_names:
+            synthetic_ds = synthetic_ds.filter(
+                lambda row: str(row.get("completion", "")).strip() != ""
+            )
+        synthetic_rows_after_completion_filter = len(synthetic_ds)
+        if "completion" in synthetic_ds.column_names:
+            before_placeholder_filter = len(synthetic_ds)
+            synthetic_ds = synthetic_ds.filter(
+                lambda row: (
+                    extract_guess_word(str(row.get("completion", ""))) != "guess"
+                    or str(row.get("target_word", "")).strip().lower() == "guess"
+                )
+            )
+            synthetic_rows_removed_for_placeholder_guess = (
+                before_placeholder_filter - len(synthetic_ds)
+            )
+        if (
+            not args.allow_synthetic_eval_word_overlap
+            and eval_words
+            and "completion" in synthetic_ds.column_names
+        ):
+            before_overlap_filter = len(synthetic_ds)
+            synthetic_ds = synthetic_ds.filter(
+                lambda row: (
+                    extract_guess_word(str(row.get("completion", ""))) not in eval_words
+                    and str(row.get("target_word", "")).strip().lower() not in eval_words
+                )
+            )
+            synthetic_rows_removed_for_eval_word_overlap = (
+                before_overlap_filter - len(synthetic_ds)
+            )
+        synthetic_rows_appended = len(synthetic_ds)
+        if synthetic_rows_appended > 0:
+            train_base = concatenate_datasets([train_base, synthetic_ds])
+        print(
+            "synthetic append: "
+            f"path={synthetic_path} rows_before_filter={synthetic_rows_before} "
+            f"rows_after_completion_filter={synthetic_rows_after_completion_filter} "
+            f"rows_removed_for_placeholder_guess={synthetic_rows_removed_for_placeholder_guess} "
+            f"rows_removed_for_eval_word_overlap={synthetic_rows_removed_for_eval_word_overlap} "
+            f"rows_appended={synthetic_rows_appended}"
+        )
 
     run_dir = Path(args.run_dir)
     data_dir = run_dir / "data"
@@ -153,6 +239,9 @@ def build(args: argparse.Namespace) -> None:
             "eval": "remaining validation groups",
             "group_key": "experiment::task_id",
             "seed": args.seed,
+            "synthetic_append_hf_path": args.append_synthetic_hf_path,
+            "allow_synthetic_eval_word_overlap": args.allow_synthetic_eval_word_overlap,
+            "synthetic_eval_word_types_blocked": len(eval_words),
         },
         "splits": {
             "train_base": {"path": str(train_path), "rows": len(train_base)},
@@ -165,6 +254,15 @@ def build(args: argparse.Namespace) -> None:
             "validation_raw_rows": len(validation_raw),
             "train_pair_rows": len(train_base),
             "validation_pair_rows": len(validation_flat),
+            "synthetic_rows_appended": synthetic_rows_appended,
+            "synthetic_rows_before_filter": synthetic_rows_before,
+            "synthetic_rows_after_completion_filter": synthetic_rows_after_completion_filter,
+            "synthetic_rows_removed_for_placeholder_guess": (
+                synthetic_rows_removed_for_placeholder_guess
+            ),
+            "synthetic_rows_removed_for_eval_word_overlap": (
+                synthetic_rows_removed_for_eval_word_overlap
+            ),
         },
     }
 
@@ -187,6 +285,12 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--role", type=str, default="WordGuesser")
     parser.add_argument("--query-fraction", type=float, default=0.4)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--append-synthetic-hf-path", type=str, default="")
+    parser.add_argument(
+        "--allow-synthetic-eval-word-overlap",
+        action="store_true",
+        help="Allow appended synthetic rows whose guessed/target words appear in eval.",
+    )
     return parser
 
 

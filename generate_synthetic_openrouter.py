@@ -126,17 +126,49 @@ def load_instances(source: str, timeout_seconds: float) -> dict[str, list[dict[s
     return out
 
 
-def call_chat(client: OpenAI, model: str, messages: list[dict[str, str]], temperature: float, max_output_tokens: int, retries: int, retry_sleep_seconds: float) -> tuple[str, int, int]:
+def read_jsonl(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    out: list[dict[str, Any]] = []
+    for raw in path.read_text().splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(obj, dict):
+            out.append(obj)
+    return out
+
+
+def parse_game_num(game_id: str) -> int | None:
+    m = re.search(r"(\d+)$", str(game_id))
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except Exception:
+        return None
+
+
+def call_chat(client: OpenAI, model: str, messages: list[dict[str, str]], temperature: float, max_output_tokens: int, retries: int, retry_sleep_seconds: float, reasoning_effort: str | None = None) -> tuple[str, int, int]:
     attempt = 0
     while True:
         attempt += 1
         try:
+            req: dict[str, Any] = {
+                "model": model,
+                "messages": messages,
+                "temperature": temperature,
+                "max_tokens": max_output_tokens,
+                "extra_headers": OPENROUTER_HEADERS,
+            }
+            if reasoning_effort:
+                req["extra_body"] = {"reasoning": {"effort": reasoning_effort, "exclude": True}}
             rsp = client.chat.completions.create(
-                model=model,
-                messages=messages,
-                temperature=temperature,
-                max_tokens=max_output_tokens,
-                extra_headers=OPENROUTER_HEADERS,
+                **req,
             )
             content = rsp.choices[0].message.content
             if isinstance(content, list):
@@ -153,10 +185,12 @@ def call_chat(client: OpenAI, model: str, messages: list[dict[str, str]], temper
                 text = str(content or "").strip()
             usage = rsp.usage
             return text, int(getattr(usage, "prompt_tokens", 0) or 0), int(getattr(usage, "completion_tokens", 0) or 0)
-        except Exception:
+        except Exception as exc:
             if attempt >= retries:
                 raise
-            time.sleep(retry_sleep_seconds * attempt)
+            sleep_s = retry_sleep_seconds * attempt
+            print(f"  [retry] model={model} attempt={attempt}/{retries} waiting={sleep_s:.1f}s error={type(exc).__name__}")
+            time.sleep(sleep_s)
 
 
 def play_game(args: argparse.Namespace, client: OpenAI, placeholder_words: set[str], game_id_num: int, task_id: int, guesser_model: str, experiment: str, target_item: dict[str, Any], quiet: bool) -> tuple[dict[str, Any], dict[str, Any] | None]:
@@ -215,7 +249,7 @@ def play_game(args: argparse.Namespace, client: OpenAI, placeholder_words: set[s
     try:
         for turn in range(1, args.max_turns + 1):
             d_msgs = describer_messages(turn)
-            d_text, ptok, ctok = call_chat(client, args.describer_model, d_msgs, args.describer_temperature, args.describer_max_output_tokens, args.retries, args.retry_sleep_seconds)
+            d_text, ptok, ctok = call_chat(client, args.describer_model, d_msgs, args.describer_temperature, args.describer_max_output_tokens, args.retries, args.retry_sleep_seconds, args.reasoning_effort)
             ptok_total += ptok
             ctok_total += ctok
 
@@ -235,7 +269,7 @@ def play_game(args: argparse.Namespace, client: OpenAI, placeholder_words: set[s
                             "Return a new clue with the same format: CLUE: <short clue>"
                         )},
                     ]
-                    rd_text, ptok, ctok = call_chat(client, args.describer_model, rd_msgs, max(0.2, args.describer_temperature), args.describer_max_output_tokens, args.retries, args.retry_sleep_seconds)
+                    rd_text, ptok, ctok = call_chat(client, args.describer_model, rd_msgs, max(0.2, args.describer_temperature), args.describer_max_output_tokens, args.retries, args.retry_sleep_seconds, args.reasoning_effort)
                     ptok_total += ptok
                     ctok_total += ctok
                     clue = normalize_prefixed_line(rd_text, "CLUE:")
@@ -253,7 +287,7 @@ def play_game(args: argparse.Namespace, client: OpenAI, placeholder_words: set[s
 
             prompt = game_prompt(clue_body)
             g_msgs = [{"role": "system", "content": GUESSER_SYSTEM}, {"role": "user", "content": prompt}]
-            g_text, ptok, ctok = call_chat(client, guesser_model, g_msgs, args.guesser_temperature, args.guesser_max_output_tokens, args.retries, args.retry_sleep_seconds)
+            g_text, ptok, ctok = call_chat(client, guesser_model, g_msgs, args.guesser_temperature, args.guesser_max_output_tokens, args.retries, args.retry_sleep_seconds, args.reasoning_effort)
             ptok_total += ptok
             ctok_total += ctok
 
@@ -273,7 +307,7 @@ def play_game(args: argparse.Namespace, client: OpenAI, placeholder_words: set[s
                             "Reply with exactly one non-empty guess in this form: GUESS: <word>"
                         )},
                     ]
-                    rg_text, ptok, ctok = call_chat(client, guesser_model, rg_msgs, 0.0, args.guesser_max_output_tokens, args.retries, args.retry_sleep_seconds)
+                    rg_text, ptok, ctok = call_chat(client, guesser_model, rg_msgs, 0.0, args.guesser_max_output_tokens, args.retries, args.retry_sleep_seconds, args.reasoning_effort)
                     ptok_total += ptok
                     ctok_total += ctok
                     guess = normalize_prefixed_line(rg_text, "GUESS:")
@@ -348,12 +382,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--timeout-seconds", type=float, default=90.0)
     p.add_argument("--retries", type=int, default=3)
     p.add_argument("--retry-sleep-seconds", type=float, default=1.5)
+    p.add_argument("--reasoning-effort", type=str, choices=["none", "low", "medium", "high"], default=None)
     p.add_argument("--empty-guess-retry-attempts", type=int, default=1)
     p.add_argument("--placeholder-guess-words", type=str, nargs="+", default=list(DEFAULT_PLACEHOLDER_GUESS_WORDS))
     p.add_argument("--sleep-between-calls-seconds", type=float, default=0.0)
     p.add_argument("--strict-taboo-rules", dest="strict_taboo_rules", action="store_true")
     p.add_argument("--no-strict-taboo-rules", dest="strict_taboo_rules", action="store_false")
     p.set_defaults(strict_taboo_rules=True)
+    p.add_argument("--resume", action="store_true")
     p.add_argument("--save-hf-dataset", action="store_true")
     p.add_argument("--checkpoint-every", type=int, default=1)
     p.add_argument("--quiet", action="store_true")
@@ -369,6 +405,8 @@ def main() -> None:
     rows_path = output_dir / "rows_wordguesser.jsonl"
     summary_path = output_dir / "summary.json"
     hf_path = output_dir / "rows_wordguesser_hf" if args.save_hf_dataset else None
+    existing_games = read_jsonl(games_path) if args.resume else []
+    existing_rows = read_jsonl(rows_path) if args.resume else []
 
     client = OpenAI(api_key=resolve_api_key(Path(args.env_file)), base_url="https://openrouter.ai/api/v1", timeout=args.timeout_seconds)
     instances = load_instances(args.instances_json, args.timeout_seconds)
@@ -391,23 +429,55 @@ def main() -> None:
         s["idx"] = idx + 1
         return dict(rows[idx])
 
+    target_total = int(args.games_per_guesser) * len(args.guesser_models)
+    existing_per_guesser: Counter[str] = Counter()
+    for g in existing_games:
+        gm = str(g.get("guesser_model", "")).strip()
+        if gm:
+            existing_per_guesser[gm] += 1
+
+    if args.resume:
+        for gi, gm in enumerate(args.guesser_models):
+            consumed = min(int(existing_per_guesser.get(gm, 0)), int(args.games_per_guesser))
+            for li in range(consumed):
+                exp = order[(gi + li) % len(order)]
+                sample_target(exp)
+
+    max_game_num = 0
+    max_task_id = 1_000_000
+    for g in existing_games:
+        n = parse_game_num(str(g.get("game_id", "")))
+        if n is not None:
+            max_game_num = max(max_game_num, n)
+        try:
+            t = int(g.get("task_id"))
+        except Exception:
+            continue
+        max_task_id = max(max_task_id, t)
+
     schedule: list[tuple[int, int, str, str, dict[str, Any]]] = []
-    counter = 0
+    next_game_num = max_game_num + 1
+    next_task_id = max_task_id + 1
     for gi, gm in enumerate(args.guesser_models):
-        for li in range(args.games_per_guesser):
+        start_li = min(int(existing_per_guesser.get(gm, 0)), int(args.games_per_guesser)) if args.resume else 0
+        for li in range(start_li, args.games_per_guesser):
             exp = order[(gi + li) % len(order)]
-            counter += 1
-            schedule.append((counter, 1_000_000 + counter, gm, exp, sample_target(exp)))
+            schedule.append((next_game_num, next_task_id, gm, exp, sample_target(exp)))
+            next_game_num += 1
+            next_task_id += 1
     source_stats = {k: len(v) for k, v in instances.items()}
 
     if not args.quiet:
         print(f"output_dir: {output_dir}")
-        print(f"games scheduled: {len(schedule)}")
+        print(f"games target total: {target_total}")
+        print(f"games remaining this run: {len(schedule)}")
         print(f"describer: {args.describer_model}")
         print(f"guessers: {args.guesser_models}")
+        if args.resume:
+            print(f"resume mode: loaded games={len(existing_games)} rows={len(existing_rows)}")
 
-    games: list[dict[str, Any]] = []
-    rows: list[dict[str, Any]] = []
+    games: list[dict[str, Any]] = list(existing_games)
+    rows: list[dict[str, Any]] = list(existing_rows)
     fatal_error: str | None = None
 
     def checkpoint(partial: bool, fatal: str | None) -> dict[str, Any]:
@@ -423,10 +493,11 @@ def main() -> None:
                 "guesser_models": args.guesser_models, "placeholder_guess_words": args.placeholder_guess_words,
                 "games_per_guesser": args.games_per_guesser, "max_turns": args.max_turns, "seed": args.seed,
                 "checkpoint_every": args.checkpoint_every, "strict_taboo_rules": bool(args.strict_taboo_rules),
+                "reasoning_effort": args.reasoning_effort, "resume": bool(args.resume),
             },
             "files": {"games_jsonl": str(games_path), "rows_jsonl": str(rows_path), "summary_json": str(summary_path), "hf_rows_path": str(hf_path) if hf_path and hf_path.exists() else None},
             "results": {
-                "games_requested": len(schedule), "games_written": len(games), "rows_written": len(rows),
+                "games_requested": target_total, "games_written": len(games), "rows_written": len(rows),
                 "outcome_counts": dict(outcome_counts), "finished_games": len(finished),
                 "success_rate_finished_only": float(success / len(finished)) if finished else 0.0,
                 "mean_turns_finished_only": mean_turns, "is_partial": partial, "fatal_error": fatal,
@@ -437,7 +508,8 @@ def main() -> None:
         summary_path.write_text(json.dumps(payload, indent=2))
         return payload
 
-    with games_path.open("w") as gf, rows_path.open("w") as rf:
+    mode = "a" if args.resume else "w"
+    with games_path.open(mode) as gf, rows_path.open(mode) as rf:
         try:
             for game_id_num, task_id, gm, exp, target in schedule:
                 game, row = play_game(args, client, placeholder_words, game_id_num, task_id, gm, exp, target, args.quiet)
@@ -459,7 +531,7 @@ def main() -> None:
             if not args.quiet:
                 print(f"\nFatal error: {fatal_error}")
         finally:
-            checkpoint(len(games) < len(schedule), fatal_error)
+            checkpoint(len(games) < target_total, fatal_error)
 
     if args.save_hf_dataset and rows:
         assert hf_path is not None
@@ -470,7 +542,7 @@ def main() -> None:
                 hf_path.unlink()
         Dataset.from_list(rows).save_to_disk(str(hf_path))
 
-    final = checkpoint(len(games) < len(schedule), fatal_error)
+    final = checkpoint(len(games) < target_total, fatal_error)
     finished = int(final["results"]["finished_games"])
     success = int(final["results"]["outcome_counts"].get("success", 0))
 

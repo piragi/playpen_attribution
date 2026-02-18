@@ -17,6 +17,10 @@ venv/
 # Local OS files
 .DS_Store
 
+# Local secrets
+.env
+.env.*
+
 # Local runtime artifacts
 runs/
 taboo_sft_lora/

@@ -163,6 +163,7 @@ def save_outputs(
     examples: list[dict],
     sae_id: str,
     feature_presence: np.ndarray,
+    feature_activation_mean: np.ndarray,
     sample_stats: np.ndarray,
     seq_lens: np.ndarray,
     summary: dict,
@@ -188,6 +189,7 @@ def save_outputs(
     np.savez_compressed(
         npz_path,
         feature_presence=feature_presence,
+        feature_activation_mean=feature_activation_mean,
         sample_stats=sample_stats,
         seq_lens=seq_lens,
         stat_feature_names=np.asarray(SAMPLE_STAT_NAMES, dtype="<U64"),
@@ -253,6 +255,7 @@ def main() -> None:
     d_sae = int(sae.cfg.d_sae)
     n = len(examples)
     feature_presence = np.zeros((n, d_sae), dtype=np.bool_)
+    feature_activation_mean = np.zeros((n, d_sae), dtype=np.float32)
     sample_stats = np.zeros((n, len(SAMPLE_STAT_NAMES)), dtype=np.float32)
     seq_lens = np.zeros(n, dtype=np.int32)
 
@@ -274,7 +277,10 @@ def main() -> None:
             active = sae_acts > 0
 
         stats, row_presence, seq_len = sample_stats_from_sae(sae_acts, active)
+        # Per-feature positive activation strength averaged across tokens.
+        row_activation = torch.clamp(sae_acts, min=0).mean(dim=(0, 1)).to(torch.float32)
         feature_presence[i] = row_presence
+        feature_activation_mean[i] = row_activation.detach().cpu().numpy()
         sample_stats[i] = stats
         seq_lens[i] = int(seq_len)
 
@@ -300,6 +306,7 @@ def main() -> None:
         examples=examples,
         sae_id=args.sae_id,
         feature_presence=feature_presence,
+        feature_activation_mean=feature_activation_mean,
         sample_stats=sample_stats,
         seq_lens=seq_lens,
         summary=summary,
