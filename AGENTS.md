@@ -1,6 +1,6 @@
 # Playpen Attribution - Active Notes
 
-Last updated: 2026-02-17
+Last updated: 2026-02-18
 
 ## 1) Overall Goal
 - Test whether Bergson attribution can select training examples that improve downstream task learning better than matched random selection under comparable training budget.
@@ -192,4 +192,47 @@ uv run sae_analysis.py \
   --sae-id layer_17_width_16k_l0_small \
   --sae-release gemma-scope-2-1b-it-res \
   --model-name google/gemma-3-1b-it
+```
+
+## 12) Synthetic Generation Status (2026-02-18)
+- `generate_synthetic_openrouter.py` was simplified to a single-file lean generator while preserving:
+  - strict taboo rule checks (target/related words + stems),
+  - describer repair loop and guesser empty/placeholder repair loop,
+  - checkpoint-safe writes to `games.jsonl`, `rows_wordguesser.jsonl`, `summary.json`,
+  - optional `--save-hf-dataset`.
+- Current generator size: `486` lines.
+- Removed non-essential complexity:
+  - OpenRouter pricing fetch/breakdown logic,
+  - backward-compat hidden CLI args,
+  - unused target-source mode (`train_completions`),
+  - bulky per-call usage/cost breakdowns in summary.
+- Format compatibility notes:
+  - `rows_wordguesser.jsonl` keys match previous runs.
+  - `games.jsonl` keeps the fields used in current workflow, including `game`, `game_role`, and `max_turns`.
+
+## 12.1) Synthetic Quality Smoke vs Baseline
+- Baseline run:
+  - `runs/synthetic_data_row500_qwen_desc_gemma_2026_02_18_v1`
+  - success: `303/501 = 0.6048`
+  - mean turns: `2.0659`
+- Refactored script quality smoke:
+  - `runs/synthetic_quality_eval_30_refactor_2026_02_18`
+  - setup matched baseline family:
+    - describer: `qwen/qwen3-30b-a3b-instruct-2507`
+    - guessers: `allenai/olmo-3.1-32b-instruct`, `mistralai/ministral-14b-2512`, `google/gemma-3-27b-it`
+    - `games-per-guesser=10` (30 total)
+  - success: `21/30 = 0.7000`
+  - mean turns: `1.9000`
+  - zero empty clue turns and zero placeholder guess rows in this smoke run.
+
+## 12.2) Current Recommended Synthetic Command
+```bash
+uv run generate_synthetic_openrouter.py \
+  --output-dir runs/synthetic_data_row500_qwen_desc_gemma_2026_02_18_v2 \
+  --describer-model qwen/qwen3-30b-a3b-instruct-2507 \
+  --guesser-models allenai/olmo-3.1-32b-instruct mistralai/ministral-14b-2512 google/gemma-3-27b-it \
+  --games-per-guesser 167 \
+  --max-turns 3 \
+  --seed 42 \
+  --checkpoint-every 1
 ```
