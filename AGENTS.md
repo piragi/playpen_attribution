@@ -311,3 +311,197 @@ uv run generate_synthetic_openrouter.py \
 - High-attribution examples have a detectable SAE fingerprint that differs from surface-level quality signals (reward model score, difficulty label).
 - This fingerprint can transfer: once learned on real attribution labels, it can rank new/synthetic data without re-running expensive gradient-based attribution.
 - Finetuning on SAE-selected subsets outperforms matched random subsets of the same size.
+
+## 14) Implementation (SmolTalk Migration, Milestone M1)
+
+This section is an explicit execution spec for the coding team. It intentionally removes ambiguity.
+
+### 14.1) Milestone Definition (M1)
+- Goal: migrate the training/eval pipeline away from Playpen assumptions and get a **SmolTalk-only finetune + eval** run working end-to-end.
+- Dataset target: `HuggingFaceTB/smoltalk`, config `smol-magpie-ultra`.
+- Required output artifacts:
+  - `runs/smoltalk_v1/manifest.json`
+  - `runs/smoltalk_v1/data/train_base`
+  - `runs/smoltalk_v1/data/attr_query`
+  - `runs/smoltalk_v1/data/eval`
+  - `runs/smoltalk_v1/base_adapter/` with adapter weights + tokenizer + `train_metrics.json`
+  - `runs/smoltalk_v1/eval_loss_compare.json` (base vs finetuned eval loss)
+
+### 14.2) Branch and Scope Rules
+- Work on a dedicated branch for migration, not mixed with older Playpen work.
+- In Python files used by this pipeline, remove hardcoded Playpen-specific defaults/assumptions.
+- Keep old behavior only if guarded behind explicit opt-in flags. Default path should be SmolTalk-first.
+- Do not change SAE or attribution logic in M1 beyond compatibility with new manifest format.
+
+### 14.3) Exact File Changes
+
+#### A) `dataset.py` (primary rewrite target)
+- Replace Playpen-specific filtering (`meta.game`, `meta.game_role`) with a generic chat-dataset builder path for SmolTalk.
+- Add/replace CLI with the following exact arguments:
+  - `--run-dir` default `runs/smoltalk_v1`
+  - `--dataset-name` default `HuggingFaceTB/smoltalk`
+  - `--dataset-config` default `smol-magpie-ultra`
+  - `--train-size` default `8000`
+  - `--query-size` default `500`
+  - `--eval-size` default `500`
+  - `--seed` default `42`
+  - `--max-conversation-tokens` default `2000`
+  - `--min-reward-model-score` default empty/off (no filtering in M1)
+- Keep and reuse `to_prompt_completion(messages)` logic:
+  - Prompt = all turns before final assistant turn.
+  - Completion = final assistant turn.
+- Persist these columns in split datasets:
+  - Required: `row_id`, `prompt`, `completion`, `source_split`, `group_id`
+  - Metadata required for later analysis: `category`, `difficulty`, `quality`, `reward_model_score`, `conversation_tokens`
+- `group_id` for SmolTalk rows:
+  - `f"{category}::{difficulty}::{source_split}::{row_local_index}"` (stable, deterministic).
+- Split policy:
+  - Sample `train_base` from dataset `train` split (stratified by `category`).
+  - Sample `attr_query` and `eval` from dataset `test` split, disjoint, each stratified by `category`.
+- Deterministic selection:
+  - Use seeded RNG (`seed`) and deterministic per-category index sorting before sampling.
+- Manifest requirements:
+  - Update `dataset.name/config` fields to SmolTalk values.
+  - Keep `splits.train_base`, `splits.score_pool`, `splits.attr_query`, `splits.eval`.
+  - Include a `split_policy` block with explicit counts and seed.
+  - Include `filter_stats` counts for before/after flattening and truncation.
+
+#### B) `finetune.py` (default/path cleanup)
+- Update defaults only (no algorithm change needed):
+  - `--manifest` default -> `runs/smoltalk_v1/manifest.json`
+  - `--output-dir` default -> `runs/smoltalk_v1/base_adapter`
+  - `--max-length` default -> `2048`
+- Keep continuation support via `--resume-adapter` unchanged.
+- Keep completion-only loss objective unchanged.
+
+#### C) `score.py` (default/path cleanup only in M1)
+- Update defaults:
+  - `--manifest` default -> `runs/smoltalk_v1/manifest.json`
+  - `--adapter-path` default -> `runs/smoltalk_v1/base_adapter`
+  - `--output-dir` default -> `runs/smoltalk_v1/attribution`
+- Keep `--tokenization-mode finetune_raw` path unchanged (mandatory for alignment).
+- No M1 algorithm changes.
+
+#### D) `eval_words.py` (do not use for SmolTalk M1)
+- This script is Taboo/`GUESS:` specific and not valid for general chat evaluation.
+- For M1, add a new script instead: `eval_loss.py`.
+
+#### E) New file `eval_loss.py` (required in M1)
+- Purpose: compare eval NLL/loss between base model and finetuned adapter on manifest eval split.
+- Required CLI:
+  - `--manifest` default `runs/smoltalk_v1/manifest.json`
+  - `--eval-split` default `eval`
+  - `--base-model` default `google/gemma-3-1b-it`
+  - `--adapter-path` optional
+  - `--max-length` default `2048`
+  - `--batch-size` default `4`
+  - `--output-json` default `runs/smoltalk_v1/eval_loss_compare.json`
+- Required behavior:
+  - Load eval split from manifest.
+  - Build labels with prompt tokens masked (`-100`) and completion tokens supervised.
+  - Compute mean loss over all supervised tokens.
+  - Run twice:
+    - base model (no adapter)
+    - finetuned model (with adapter)
+  - Save JSON with:
+    - model identifiers
+    - num_eval_rows
+    - supervised_token_count
+    - eval_loss and perplexity for base and finetuned
+    - `delta_loss` and `delta_ppl`
+
+#### F) `sae_analysis.py` and `train_bidir_classifier.py` (M1)
+- No required logic changes for M1.
+- Only update default manifest paths to SmolTalk equivalents if desired.
+- Do not start SAE/classifier runs until M1 finetune+eval is passing.
+
+### 14.4) Exact Command Sequence (M1)
+
+Run these commands in order:
+
+```bash
+uv run dataset.py \
+  --run-dir runs/smoltalk_v1 \
+  --dataset-name HuggingFaceTB/smoltalk \
+  --dataset-config smol-magpie-ultra \
+  --train-size 8000 \
+  --query-size 500 \
+  --eval-size 500 \
+  --max-conversation-tokens 2000 \
+  --seed 42
+
+uv run finetune.py train \
+  --manifest runs/smoltalk_v1/manifest.json \
+  --train-split train_base \
+  --eval-split eval \
+  --output-dir runs/smoltalk_v1/base_adapter \
+  --max-length 2048
+
+uv run eval_loss.py \
+  --manifest runs/smoltalk_v1/manifest.json \
+  --eval-split eval \
+  --base-model google/gemma-3-1b-it \
+  --output-json runs/smoltalk_v1/eval_loss_compare.json
+
+uv run eval_loss.py \
+  --manifest runs/smoltalk_v1/manifest.json \
+  --eval-split eval \
+  --base-model google/gemma-3-1b-it \
+  --adapter-path runs/smoltalk_v1/base_adapter \
+  --output-json runs/smoltalk_v1/eval_loss_compare.json
+```
+
+Note:
+- The second `eval_loss.py` call should update/merge the same JSON file so both base and finetuned metrics are present.
+
+### 14.5) Hard Acceptance Criteria (M1 must pass all)
+- `dataset.py` completes and manifest exists with exact split names:
+  - `train_base`, `score_pool`, `attr_query`, `eval`.
+- Split sizes are exactly:
+  - `train_base=8000`, `attr_query=500`, `eval=500`.
+- `attr_query` and `eval` have zero `row_id` overlap.
+- `train_base` has zero overlap with `attr_query` and `eval`.
+- All rows in all splits have non-empty `prompt` and `completion`.
+- Metadata columns exist in all splits:
+  - `category`, `difficulty`, `quality`, `reward_model_score`, `conversation_tokens`.
+- Finetune run produces adapter + `train_metrics.json` with eval metrics.
+- Eval script produces `eval_loss_compare.json` containing:
+  - base loss/ppl
+  - finetuned loss/ppl
+  - deltas.
+
+### 14.6) Required Verification Checks (implement as assertions or explicit checks)
+- Check 1: `len(set(train_ids) & set(query_ids)) == 0`
+- Check 2: `len(set(train_ids) & set(eval_ids)) == 0`
+- Check 3: `len(set(query_ids) & set(eval_ids)) == 0`
+- Check 4: no empty completion rows after flattening.
+- Check 5: category distribution in sampled splits is reported in manifest (for debugging stratification).
+- Check 6: supervised token count in `eval_loss.py` is > 0.
+
+### 14.7) Common Failure Modes and Fixes
+- Failure: OOM during finetune at 2048.
+  - Fix: reduce `per_device_train_batch_size` to 1, increase grad accumulation.
+- Failure: very slow attribution later.
+  - Fix in later phase: keep `attr_query` at 500; do not increase before M2.
+- Failure: token truncation too aggressive.
+  - Fix: inspect `conversation_tokens`; consider `max-length 1536/2048` depending on hardware.
+- Failure: missing metadata in downstream scripts.
+  - Fix: ensure `dataset.py` does not drop metadata columns when saving splits.
+
+### 14.8) Explicit Non-Goals for M1
+- Do not run SAE extraction.
+- Do not run SAE predictor training.
+- Do not run continuation top-k vs random.
+- Do not add multi-seed experiment infra yet.
+- Do not tune hyperparameters beyond making M1 run successfully end-to-end.
+
+### 14.9) Post-M1 Handoff Requirements
+- Commit with:
+  - migration code changes
+  - new `eval_loss.py`
+  - manifest + eval JSON artifact paths documented in `AGENTS.md`.
+- Add a short run report block:
+  - command lines used
+  - wallclock for dataset/finetune/eval
+  - base vs finetuned loss/ppl deltas
+  - any deviations from this spec.
