@@ -382,12 +382,13 @@ def build_subsets(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Minimal Bergson scoring pipeline.")
-    parser.add_argument("--manifest", type=str, default="runs/simple_wordguesser_v1/manifest.json")
+    parser.add_argument("--manifest", type=str, default="runs/smoltalk_v1/manifest.json")
     parser.add_argument("--pool-split", type=str, default="score_pool")
     parser.add_argument("--query-split", type=str, default="attr_query")
-    parser.add_argument("--adapter-path", type=str, default="runs/simple_wordguesser_v1/base_adapter")
+    parser.add_argument("--adapter-path", type=str, default=None,
+                        help="PEFT adapter path. If omitted, --base-model is used directly.")
     parser.add_argument("--base-model", type=str, default="google/gemma-3-1b-it")
-    parser.add_argument("--output-dir", type=str, default="runs/simple_wordguesser_v1/attribution")
+    parser.add_argument("--output-dir", type=str, default="runs/smoltalk_v1/attribution")
     parser.add_argument("--token-batch-size", type=int, default=1024)
     parser.add_argument("--projection-dim", type=int, default=32)
     parser.add_argument("--preconditioning-mode", choices=["none", "query", "mixed"], default="query")
@@ -438,6 +439,9 @@ def main() -> None:
         if p.exists():
             remove_path(p)
 
+    # Resolve the effective model path: adapter if given, else the base model itself.
+    # Overwrite args.adapter_path so all downstream calls (make_index_config etc.) see it.
+    args.adapter_path = args.adapter_path if args.adapter_path else args.base_model
     ensure_adapter_config(Path(args.adapter_path), args.base_model)
 
     pool_path = pool_source
