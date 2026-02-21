@@ -109,7 +109,7 @@ def _get_magpie_score(row: dict) -> float:
 # Build SmolTalk splits
 # ---------------------------------------------------------------------------
 
-def build_smoltalk_splits(tokenizer: Any, cfg: dict) -> tuple[Dataset, Dataset, Dataset]:
+def build_smoltalk_splits(tokenizer: Any, cfg: dict) -> tuple[Dataset, Dataset, Dataset, int]:
     """Return (train, val, attr_pool) datasets."""
     print(f"Loading {cfg['dataset_name']}/{cfg['dataset_config']} (streaming) ...")
     raw = load_dataset(cfg["dataset_name"], cfg["dataset_config"], split="train", streaming=True)
@@ -120,7 +120,9 @@ def build_smoltalk_splits(tokenizer: Any, cfg: dict) -> tuple[Dataset, Dataset, 
     # Gather 2× needed so shuffle has room (keeps smoke-test fast too).
     gather_target = needed * 2
     rows: list[dict] = []
+    raw_rows_seen = 0
     for row in raw:
+        raw_rows_seen += 1
         messages = row.get("messages") or row.get("conversations") or []
         if not messages:
             continue
@@ -151,7 +153,7 @@ def build_smoltalk_splits(tokenizer: Any, cfg: dict) -> tuple[Dataset, Dataset, 
               cfg["train_size"] + cfg["val_size"] + cfg["attr_pool_size"])
     )
 
-    return train_ds, val_ds, attr_pool_ds
+    return train_ds, val_ds, attr_pool_ds, raw_rows_seen
 
 
 # ---------------------------------------------------------------------------
@@ -261,7 +263,7 @@ def main() -> None:
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    train_ds, val_ds, attr_pool_ds = build_smoltalk_splits(tokenizer, cfg)
+    train_ds, val_ds, attr_pool_ds, raw_rows_consumed = build_smoltalk_splits(tokenizer, cfg)
     query_ds = build_attr_query(tokenizer, cfg)
 
     # Save splits
@@ -291,6 +293,7 @@ def main() -> None:
         "max_length": cfg["max_length"],
         "dataset": cfg["dataset_name"],
         "dataset_config": cfg["dataset_config"],
+        "raw_rows_consumed": raw_rows_consumed,  # used by build_continuation_data.py to skip ahead
         "splits": {
             # score.py uses score_pool + attr_query
             "score_pool": splits_info["attr_pool"],
