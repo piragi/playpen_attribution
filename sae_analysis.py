@@ -26,8 +26,8 @@ from transformers import AutoModelForCausalLM
 CONFIG = {
     "base_model": "google/gemma-3-1b-pt",
     "sae_release": "gemma-scope-2-1b-pt-res",  # verify exact release name in sae_lens
-    "sae_id": "layer_12_width_16k_l0_small",   # verify sae_id for 1B
-    "layer_idx": 12,
+    "sae_id": "layer_17_width_16k_l0_small",   # verify sae_id for 1B
+    "layer_idx": 17,
     "diagnostics_path": "runs/smoltalk_v1/scores/row_diagnostics.jsonl",
     "pool_path": "runs/smoltalk_v1/data/attr_pool",
     "output_dir": "runs/smoltalk_v1/sae_features/layer12_width16k",

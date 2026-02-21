@@ -101,12 +101,9 @@ adapter directory. Always pass `--apply-chat-template` for SFT model evaluation.
 ### lm-eval + Gemma3 fix
 
 lm-eval 0.4.11 passes `dtype=` to `Gemma3ForCausalLM.__init__` instead of `torch_dtype=`,
-causing a TypeError. Fix applied directly to the installed package:
-
-```
-.venv/lib/python3.13/site-packages/lm_eval/models/huggingface.py
-lines 635, 718: dtype= → torch_dtype=
-```
+causing a TypeError. Fix applied as a runtime monkey-patch at the top of `eval_harness.py`
+(wraps `AutoModelForCausalLM.from_pretrained` to translate `dtype=` → `torch_dtype=`).
+This survives `uv sync` / reinstalls — do NOT patch the installed package directly.
 
 ### SmolTalk streaming
 

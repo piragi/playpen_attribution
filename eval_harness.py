@@ -27,17 +27,28 @@ from pathlib import Path
 
 import lm_eval
 import torch
+import transformers
+
+# lm-eval 0.4.11 passes dtype= to from_pretrained but Gemma3ForCausalLM only
+# accepts torch_dtype=. Patch here so this survives uv sync / reinstalls.
+_orig_from_pretrained = transformers.AutoModelForCausalLM.from_pretrained
+
+def _from_pretrained_compat(*args, dtype=None, torch_dtype=None, **kwargs):
+    return _orig_from_pretrained(*args, torch_dtype=torch_dtype if torch_dtype is not None else dtype, **kwargs)
+
+transformers.AutoModelForCausalLM.from_pretrained = _from_pretrained_compat
 
 # Default benchmark suite for SFT evaluation.
-# All tasks use log-prob MC scoring — no generation needed.
-# mmlu is a group task (57 subjects); it's slow but gives broad coverage.
-DEFAULT_TASKS = "arc_challenge,arc_easy,hellaswag,winogrande,mmlu"
+# Log-prob MC: arc_challenge, arc_easy, hellaswag, winogrande (, mmlu — commented: 57 subtasks, very slow)
+# Generation: ifeval (rule-based instruction following), gsm8k (math reasoning, 5-shot)
+DEFAULT_TASKS = "arc_challenge,arc_easy,hellaswag,winogrande,ifeval,gsm8k"  #,mmlu"
 
 # Metric keys lm-eval uses per task (in priority order).
 _METRIC_PRIORITY = [
-    "acc_norm,none",  # length-normalised accuracy (HellaSwag, ARC)
-    "acc,none",       # plain accuracy (PIQA, WinoGrande, MMLU)
-    "exact_match,flexible-extract",  # GSM8K
+    "acc_norm,none",                    # length-normalised accuracy (HellaSwag, ARC)
+    "acc,none",                         # plain accuracy (WinoGrande, MMLU)
+    "prompt_level_strict_acc,none",     # IFEval
+    "exact_match,flexible-extract",     # GSM8K
     "exact_match,strict-match",
 ]
 

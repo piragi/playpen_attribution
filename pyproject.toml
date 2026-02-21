@@ -20,5 +20,3 @@ dependencies = [
     "trl>=0.22,<0.23",
 ]
 
-[tool.uv.sources]
-bergson = { path = "../bergson", editable = true }
