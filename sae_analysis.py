@@ -30,7 +30,7 @@ CONFIG = {
     "layer_idx": 17,
     "diagnostics_path": "runs/smoltalk_v1/scores/row_diagnostics.jsonl",
     "pool_path": "runs/smoltalk_v1/data/attr_pool",
-    "output_dir": "runs/smoltalk_v1/sae_features/layer12_width16k",
+    "output_dir": "runs/smoltalk_v1/sae_features/layer17_width16k",
     "top_frac": 0.10,
     "bottom_frac": 0.10,
     "topk_features": 256,
@@ -88,11 +88,16 @@ def load_labels(
             rec = json.loads(line)
             records.append({
                 "pool_index": int(rec["index"]),
-                "row_id": str(rec["row_id"]),
+                "row_id": str(rec["index"]),
                 "score": float(rec["score"]),
             })
 
     n = len(records)
+    # Use raw attribution scores directly. Bergson uses unit_normalize=True and query-side
+    # TRAK preconditioning, so the scores are already cosine similarities between
+    # preconditioned gradients — the remaining length correlation (-0.33) reflects genuine
+    # content alignment with the query (shorter = more Q&A-like = closer to ARC/WinoGrande
+    # query format), not a magnitude artefact from loss_reduction=mean.
     scores = np.array([r["score"] for r in records], dtype=np.float32)
     order = np.argsort(scores)  # ascending
 

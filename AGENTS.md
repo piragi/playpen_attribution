@@ -9,14 +9,14 @@ Last updated: 2026-02-21
 Prove that **SAE feature analysis combined with data attribution can identify higher-quality SFT training data**, and that training on this selected data produces better instruction-following models than randomly sampled or heuristically filtered data.
 
 Concretely:
-1. **Phase 1**: LoRA SFT of Gemma-3-270m (base) on SmolTalk → establish a training run whose samples can be attributed.
-2. **Phase 2**: Compute gradient-based data attribution (Bergson) → label each training example by influence on validation loss.
-3. **Phase 3**: Extract SAE features (GemmaScope 2) from each example using the **base model** → train a lightweight classifier that predicts attribution from SAE features.
-4. **Phase 4**: Apply the classifier to a larger SmolTalk pool → select top-scoring data → continue fine-tuning on it → compare against random and Magpie-score baselines.
+1. **Phase 1**: LoRA SFT of Gemma-3-1b (base) on SmolTalk → establish a training run whose samples can be attributed. ✅
+2. **Phase 2**: Compute gradient-based data attribution (Bergson) → score each pool example by influence toward a high-quality query. ← next
+3. **Phase 3**: Extract SAE features (GemmaScope 2) from each pool example using the **base model** → train a lightweight classifier that predicts attribution from SAE features.
+4. **Phase 4**: Apply the classifier to a larger SmolTalk pool → select top-scoring data → continue fine-tuning → compare quality arm vs random arm on benchmarks.
 
 Core claim: **SAE fingerprinting makes data attribution scalable** — one forward pass through model + SAE + small classifier replaces expensive gradient computation.
 
-Baseline to beat: **Magpie quality score** (0–5, built into SmolTalk rows). If SAE-selected data outperforms Magpie-filtered data, we have a result.
+Baseline to beat: **random selection from the same pool**. If the SAE-selected quality arm outperforms the random arm, we have a result.
 
 Benchmarks: ARC-Challenge, ARC-Easy, HellaSwag, WinoGrande, MMLU (SmolTalk paper set; lm-eval harness, log-prob scoring, `--apply-chat-template` required for SFT models).
 
@@ -24,27 +24,37 @@ Benchmarks: ARC-Challenge, ARC-Easy, HellaSwag, WinoGrande, MMLU (SmolTalk paper
 
 ## 2) Key Design Decisions & Rationale
 
-### Why Gemma-3-270m base (not IT)?
+### Why Gemma-3-1b base (not IT)?
 
-- **GemmaScope 2** SAEs are trained on base model activations. Using the IT model for SAE extraction creates a distribution mismatch — SAE features are miscalibrated on IT activations.
-- Base model has **higher gradient variance** → cleaner attribution labels. IT has already learned instruction structure, so gradients are smaller and noisier for attribution.
-- We borrow the IT tokenizer for its chat template (same vocabulary, same token IDs — the only difference is `chat_template` in `tokenizer_config.json`). This is the standard approach for SFT from a base model.
+- **GemmaScope 2** SAEs are trained on base model activations (layer 17, width 16k). Using the IT model for SAE extraction creates a distribution mismatch.
+- Base model has **higher gradient variance** → cleaner attribution labels.
+- We borrow the IT tokenizer for its chat template (same vocabulary, same token IDs). This is the standard approach for SFT from a base model.
 
 ### Why LoRA (not full fine-tuning)?
 
 - Gradient computation for attribution concentrates on LoRA adapter parameters, keeping the signal focused.
 - Fits in much less VRAM; faster iteration.
-- LoRA adapters are the de facto standard for SFT at this scale.
 
-### Why SmolTalk?
+### Why SmolTalk `all` config for train/pool?
 
-- High quality variance: mix of Magpie-Ultra, Smol-Rewrite, Smol-Constraints, etc. Magpie quality scores (0–5) give a natural baseline to beat.
-- Realistic instruction-following data — direct application of the technique.
-- Previously, CPT on FineWeb regressed on all benchmarks regardless of hyperparameters (see §6). SFT on instruction data is a cleaner experimental setup.
+High quality variance (mix of Magpie-Ultra, Smol-Rewrite, Smol-Constraints, etc.) makes attribution signal meaningful. `smol-magpie-ultra` is a config of `HuggingFaceTB/smoltalk` that has quality labels preserved; the `all` config strips per-source metadata.
 
-### Why the `all` config, not `smol-magpie-ultra`?
+### Attribution query: smol-magpie-ultra (good/excellent)
 
-`smol-magpie-ultra` is a separate dataset, not a config of `HuggingFaceTB/smoltalk`. Available configs: `all`, `smol-magpie-ultra` (as separate HF dataset), `smol-constraints`, `smol-rewrite`, etc. Use `all` for maximum quality variance.
+The attr_query defines "quality" in gradient space — attribution scores measure how much a pool example helped produce behaviour like the query.
+
+- **Old query** (ARC-Challenge + WinoGrande): biased toward very short multiple-choice Q&A (~71 tokens/example). Created a -0.33 length correlation in attribution scores — shorter pool examples scored higher simply because they resembled the short query, not because they were better training data.
+- **New query**: 1,024 smol-magpie-ultra examples filtered to quality ∈ {good, excellent} (~820 tokens/example). Richer, more representative of what the model actually trained on.
+
+Load directly from the `smol-magpie-ultra` config (which preserves quality labels), not from `all` (which strips them).
+
+### No residualization in sae_analysis.py
+
+Bergson uses `unit_normalize=True` + query-side TRAK preconditioning. The remaining length correlation in scores is content-based (longer examples genuinely more aligned with the richer smol-magpie-ultra query direction), not a magnitude artifact. Do **not** regress out length.
+
+### SAE feature extraction: mean(SAE(acts)) not SAE(mean(acts))
+
+The SAE is a nonlinear JumpReLU encoder. Always encode each token position through the SAE first, then average the resulting sparse vectors over positions. The reverse order (average activations first, then encode once) gives wrong results.
 
 ---
 
@@ -52,12 +62,14 @@ Benchmarks: ARC-Challenge, ARC-Easy, HellaSwag, WinoGrande, MMLU (SmolTalk paper
 
 | Script | Role |
 |---|---|
-| `build_sft_data.py` | Tokenize SmolTalk with IT chat template, mask prompts, produce train/val/attr_pool/attr_query splits |
+| `build_sft_data.py` | Tokenize SmolTalk with IT chat template, mask prompts, produce train/val/attr_pool splits |
+| `rebuild_attr_query.py` | Rebuild attr_query from smol-magpie-ultra (quality-filtered) without touching other splits |
 | `finetune.py` | LoRA SFT on pre-tokenized data; saves IT tokenizer alongside adapter |
 | `eval_harness.py` | lm-eval benchmark evaluation (ARC, HellaSwag, WinoGrande, MMLU) |
-| `score.py` | Bergson gradient-based attribution pipeline; supports PEFT adapters |
-| `sae_analysis.py` | SAE feature extraction from base model (GemmaScope 2) |
+| `score.py` | Bergson gradient-based attribution; pool vs attr_query; supports PEFT adapters |
+| `sae_analysis.py` | SAE feature extraction from base model (layer 17, width 16k); raw scores |
 | `train_bidir_classifier.py` | SAE fingerprint classifier (predicts attribution from SAE features) |
+| `build_continuation_data.py` | Score next SmolTalk chunk with classifier → quality arm + random arm |
 
 ---
 
@@ -66,8 +78,8 @@ Benchmarks: ARC-Challenge, ARC-Easy, HellaSwag, WinoGrande, MMLU (SmolTalk paper
 ### Base model + IT tokenizer pattern
 
 ```
-Training:    AutoModelForCausalLM.from_pretrained("google/gemma-3-270m")  ← base weights
-Tokenizer:   AutoTokenizer.from_pretrained("google/gemma-3-270m-it")      ← chat template
+Training:    AutoModelForCausalLM.from_pretrained("google/gemma-3-1b-pt")   ← base weights
+Tokenizer:   AutoTokenizer.from_pretrained("google/gemma-3-1b-it")           ← chat template
 ```
 
 After training, the IT tokenizer is saved alongside the LoRA adapter. Downstream scripts
@@ -79,7 +91,7 @@ Pass **pre-tokenized data** (`input_ids` + `labels` columns) directly. Bergson s
 tokenization when `input_ids` is already present.
 
 - Pool (SmolTalk attr_pool): prompt tokens masked with `-100`, only assistant tokens supervised.
-- Query (attr_query): same masking — ARC-Challenge + WinoGrande formatted as instruct examples.
+- Query (attr_query): same masking — smol-magpie-ultra examples formatted with IT chat template.
 
 ### Prompt masking
 
@@ -91,6 +103,9 @@ boundaries per assistant turn. Multi-turn conversations are handled correctly.
 Pass `--adapter-path <adapter_dir>` to `score.py`. It calls `ensure_adapter_config()` which
 injects a `config.json` (base model architecture) into the adapter directory so Bergson can
 load the full model via PEFT.
+
+score.py defaults: `unit_normalize=True`, `query_preconditioner` (TRAK KFAC eigendecomposition
+on query side), `projection_dim=32`, `mixing_coefficient=0.99`. These are correct — do not change.
 
 ### eval_harness.py + IT tokenizer
 
@@ -123,15 +138,22 @@ Gemma 3's 262k vocabulary causes OOM when computing eval loss (logits cast to fl
 runs/smoltalk_v1/
   manifest.json
   data/
-    train/        50,000 rows — SFT training
-    val/          2,000 rows  — SFT validation (Bergson query)
-    attr_pool/    20,000 rows — attribution pool (scored by Bergson)
-    attr_query/   1,024 rows  — ARC-Challenge + WinoGrande as instruct examples
-  adapter/        LoRA adapter + IT tokenizer
+    train/        100,000 rows — SFT training
+    val/            5,000 rows — SFT validation
+    attr_pool/     50,000 rows — attribution pool (scored by Bergson)
+    attr_query/     1,024 rows — smol-magpie-ultra quality∈{good,excellent}
+  adapter/        LoRA adapter + IT tokenizer (Gemma-3-1b)
   scores/
     row_diagnostics.jsonl
     summary.json
     subsets/
+  sae_features/
+    layer17_width16k/   — SAE features + attribution labels for pool
+  sae_classifier/
+    K256/best_model.pt  — best SAEFingerprint classifier
+  continuation/
+    quality/    — top-20k by classifier score
+    random/     — next-20k in stream (unselected baseline)
 ```
 
 ---
@@ -144,33 +166,55 @@ runs/smoltalk_v1/
 |---|---|
 | `dataset_name` | `HuggingFaceTB/smoltalk` |
 | `dataset_config` | `all` |
-| `base_model` | `google/gemma-3-270m` |
-| `tokenizer_model` | `google/gemma-3-270m-it` |
-| `max_length` | 1024 (to be updated after 5090 profiling) |
-| `train_size` | 50,000 |
-| `val_size` | 2,000 |
-| `attr_pool_size` | 20,000 |
-| `query_per_task` | 512 |
+| `base_model` | `google/gemma-3-1b-pt` |
+| `tokenizer_model` | `google/gemma-3-1b-it` |
+| `max_length` | 1024 |
+| `train_size` | 100,000 |
+| `val_size` | 5,000 |
+| `attr_pool_size` | 50,000 |
+
+### rebuild_attr_query.py
+
+| Parameter | Value |
+|---|---|
+| `query_smol_size` | 1,024 |
+| `quality_min` | `{good, excellent}` |
+| Source | `smol-magpie-ultra` config (first N passing filter, stream order) |
 
 ### finetune.py
 
 | Parameter | Value |
 |---|---|
-| `base_model` | `google/gemma-3-270m` |
+| `base_model` | `google/gemma-3-1b-pt` |
 | `num_train_epochs` | 2 |
 | `learning_rate` | 3e-4 |
 | `warmup_ratio` | 0.03 |
 | `weight_decay` | 0.01 |
 | `lr_scheduler_type` | cosine |
-| `per_device_train_batch_size` | 1 (to be updated after 5090 profiling) |
-| `gradient_accumulation_steps` | 16 |
 | `lora_r` | 16 |
 | `lora_alpha` | 32 |
 | `lora_dropout` | 0.05 |
 | `lora_target_modules` | `q_proj,k_proj,v_proj,o_proj` |
 
-Effective batch size = per_device_train_batch_size × gradient_accumulation_steps.
-After 5090 profiling, increase batch size and reduce accumulation steps accordingly.
+### train_bidir_classifier.py
+
+| Parameter | Value |
+|---|---|
+| `sae_features_dir` | `runs/smoltalk_v1/sae_features/layer17_width16k` |
+| `k_values` | `[64, 128, 256, 512]` |
+| `d_embed` | 64 |
+| `d_hidden` | 128 |
+| `best_k` | 256 (from ablation) |
+
+### build_continuation_data.py
+
+| Parameter | Value |
+|---|---|
+| `pool_size` | 50,000 |
+| `continuation_size` | 20,000 |
+| `classifier_k` | 256 |
+| `sae_id` | `layer_17_width_16k_l0_small` |
+| `layer_idx` | 17 |
 
 ---
 
@@ -186,25 +230,17 @@ After 5090 profiling, increase batch size and reduce accumulation steps accordin
 
 ### RTX 5090 (32 GB) — current
 
-Profiling TBD (`vram_profile.py`). Expected to unlock:
-- seq_len ≥ 2048 for both models
-- per_device_train_batch_size ≥ 4 for 270M
-
+Profiling TBD (`vram.py`). Expected to unlock seq_len ≥ 2048 and larger batch sizes.
 Update this section after profiling run.
 
 ---
 
 ## 8) CPT/FineWeb History (v1/v2 — abandoned)
 
-The original plan was continued pretraining (CPT) on FineWeb. This was abandoned because:
+The original plan was continued pretraining (CPT) on FineWeb. Abandoned because:
 
 - **v1** (lr=1e-4, wd=0.1, 100M tokens): Regressed on all benchmarks (worst: ARC-Easy −0.073).
 - **v2** (lr=3e-5, wd=0.01, 200M tokens): Plan was written but never run — pivot to SFT instead.
-
-Root causes of CPT regression:
-1. LR too high (should be eta_min of original schedule, ~10x below original peak)
-2. Weight decay too aggressive for CPT
-3. No data replay
 
 SAE classifier results from v1 pilot (despite regressed labels):
 
@@ -215,16 +251,16 @@ SAE classifier results from v1 pilot (despite regressed labels):
 | **Mean pooling, K=256** | **0.748** | **0.682** |
 | Attention pooling, K=256 | 0.742 | 0.678 |
 
-Winner: mean pooling, K=256, no global stats. This architecture carries forward to v3.
+Winner: mean pooling, K=256, no global stats. Architecture carries forward.
 
 ---
 
 ## 9) Open Questions
 
-1. **seq_len**: After 5090 profiling, decide whether to increase max_length beyond 1024. Higher seq_len passes more SmolTalk examples through the filter and includes more complex multi-turn conversations.
+1. **Benchmark sensitivity**: lm-eval on a 1B model over short finetunes has real variance. May need to compare deltas vs v1 baseline rather than absolute scores to see signal.
 
-2. **Pool size**: Currently scoring 20k examples from attr_pool against 2k val. Is 20k enough to train a good classifier? May need to increase attr_pool_size.
+2. **Selection rate**: quality arm = top-20k of 50k (40%). If attribution signal is weak, this may not be selective enough. Could tighten to top-10k in a follow-up.
 
-3. **SAE layer choice**: v1 used layer 12 only. The classifier may benefit from ablating layers 9, 12, 15, or concatenated. Worth doing if AUROC < 0.75.
+3. **SAE layer ablation**: Currently layer 17 only. Could try layers 9, 12, 15, or concatenated if classifier AUROC stays below 0.75.
 
-4. **Continuation experiment design**: After classifier training, should the continuation fine-tune start from the original LoRA adapter (Phase 1) or from base? Starting from the adapter is more natural (simulates real data curation).
+4. **seq_len**: After 5090 profiling, consider increasing max_length beyond 1024. Higher seq_len passes more SmolTalk examples and includes longer conversations.

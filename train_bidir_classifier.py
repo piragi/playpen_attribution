@@ -25,8 +25,8 @@ from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader, Dataset, random_split
 
 CONFIG = {
-    "sae_features_dir": "runs/smoltalk_v1/sae_features/layer12_width16k",
-    "sae_id": "layer_12_width_16k_l0_small",
+    "sae_features_dir": "runs/smoltalk_v1/sae_features/layer17_width16k",
+    "sae_id": "layer_17_width_16k_l0_small",
     "d_sae": 16384,
     "output_dir": "runs/smoltalk_v1/sae_classifier",
     # Model hyperparameters
@@ -200,6 +200,19 @@ def run_baselines(npz_path: Path, train_idx: np.ndarray, val_idx: np.ndarray) ->
     y_val = all_labels[val_idx].astype(float)
 
     results: dict[str, dict] = {}
+
+    # A0: seq_len only (sanity check for length confound)
+    seq_len = data["global_stats"][:, 0:1]  # first stat is seq_len
+    scaler0 = StandardScaler()
+    x_tr0 = scaler0.fit_transform(seq_len[train_idx])
+    x_va0 = scaler0.transform(seq_len[val_idx])
+    clf_a0 = LogisticRegression(max_iter=1000, C=1.0)
+    clf_a0.fit(x_tr0, y_train)
+    probs_a0 = clf_a0.predict_proba(x_va0)[:, 1]
+    results["A0_length_only"] = {
+        "val_auroc": float(roc_auc_score(y_val, probs_a0)),
+        "val_acc": float(((probs_a0 >= 0.5) == y_val).mean()),
+    }
 
     # A: global stats only
     stats = data["global_stats"]

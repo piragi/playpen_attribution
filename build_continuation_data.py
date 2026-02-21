@@ -33,10 +33,10 @@ CONFIG = {
     # Classifier: K must match the best-K chosen from train_bidir_classifier.py ablation
     "classifier_k": 256,
     "classifier_dir": "runs/smoltalk_v1/sae_classifier",
-    # SAE — update sae_release/sae_id to match sae_analysis.py CONFIG
-    "sae_release": "gemma-scope-2-1b-pt-res",  # verify exact name in sae_lens
-    "sae_id": "layer_12_width_16k_l0_small",   # verify for 1B
-    "layer_idx": 12,
+    # SAE — must match sae_analysis.py CONFIG exactly
+    "sae_release": "gemma-scope-2-1b-pt-res",
+    "sae_id": "layer_17_width_16k_l0_small",
+    "layer_idx": 17,
     # Classifier architecture — must match train_bidir_classifier.py CONFIG
     "d_sae": 16384,
     "d_embed": 64,
@@ -82,15 +82,13 @@ def extract_sae_features(
     ids_t = torch.tensor([input_ids], dtype=torch.long, device=device)
     with torch.inference_mode():
         model(input_ids=ids_t)
-    acts = captured["acts"]  # (1, seq_len, d_model)
+        acts = captured["acts"]  # (1, seq_len, d_model)
+        # Encode every token position through the SAE, then mean over positions.
+        # Must match sae_analysis.py: mean(SAE(acts)) not SAE(mean(acts)).
+        sae_out = sae.encode(acts.to(next(sae.parameters()).device))  # (1, seq_len, d_sae)
 
-    # Mean-pool over sequence positions (matches sae_analysis.py approach)
-    acts_mean = acts.mean(dim=1)  # (1, d_model)
-
-    with torch.inference_mode():
-        sae_out = sae.encode(acts_mean.to(dtype))  # (1, d_sae)
-
-    activations = sae_out[0].float().cpu().numpy()  # (d_sae,)
+    # Mean over sequence, clamping negatives (JumpReLU already sparse, but be safe)
+    activations = sae_out.squeeze(0).clamp(min=0).mean(dim=0).float().cpu().numpy()  # (d_sae,)
 
     # Top-k by activation value
     nonzero_idx = np.nonzero(activations)[0]

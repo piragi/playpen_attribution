@@ -174,11 +174,19 @@ def run_score(
 
 def get_score_vector(score_run: Path, score_mode: str) -> np.ndarray:
     scores = load_scores(score_run)
+    raw = scores[:]
+    # Bergson stores a structured array with fields like score_0 (bfloat16), written_0 (bool).
+    # Extract the first score field as float32.
+    if raw.dtype.names is not None:
+        score_fields = [n for n in raw.dtype.names if n.startswith("score_")]
+        matrix = raw[score_fields[0]].astype(np.float32)
+    else:
+        matrix = np.asarray(raw, dtype=np.float32)
+
     if score_mode == "nearest":
-        matrix = np.asarray(scores[:], dtype=np.float32)
         values = matrix if matrix.ndim == 1 else matrix.max(axis=1)
     else:
-        values = np.asarray(scores.get(slice(None), score_idx=0), dtype=np.float32)
+        values = matrix if matrix.ndim == 1 else matrix[:, 0]
 
     return np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)
 
@@ -381,6 +389,12 @@ def main() -> None:
     parser.add_argument("--subset-k", type=int, default=256)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--allow-random-overlap", action="store_true")
+    parser.add_argument(
+        "--postprocess-only",
+        action="store_true",
+        default=False,
+        help="Skip cleanup and gradient/score computation; re-run diagnostics/subsets on existing scores.",
+    )
     parser.set_defaults(unit_normalize=True)
     args = parser.parse_args()
 
@@ -397,61 +411,62 @@ def main() -> None:
     subsets_dir = out / "subsets"
     pretokenized_root = out / "_pretokenized_finetune"
 
-    to_clean = [
-        query_run,
-        part_path(query_run),
-        score_run,
-        part_path(score_run),
-        diagnostics_path,
-        summary_path,
-        subsets_dir,
-    ]
-    if args.preconditioning_mode == "mixed":
-        to_clean.extend([pool_pre, part_path(pool_pre)])
-    if args.tokenization_mode == "finetune_raw":
-        to_clean.append(pretokenized_root)
-    for p in to_clean:
-        if p.exists():
-            remove_path(p)
+    if not args.postprocess_only:
+        to_clean = [
+            query_run,
+            part_path(query_run),
+            score_run,
+            part_path(score_run),
+            diagnostics_path,
+            summary_path,
+            subsets_dir,
+        ]
+        if args.preconditioning_mode == "mixed":
+            to_clean.extend([pool_pre, part_path(pool_pre)])
+        if args.tokenization_mode == "finetune_raw":
+            to_clean.append(pretokenized_root)
+        for p in to_clean:
+            if p.exists():
+                remove_path(p)
 
-    # Resolve the effective model path: adapter if given, else the base model itself.
-    # Overwrite args.adapter_path so all downstream calls (make_index_config etc.) see it.
-    args.adapter_path = args.adapter_path if args.adapter_path else args.base_model
-    ensure_adapter_config(Path(args.adapter_path), args.base_model)
+        # Resolve the effective model path: adapter if given, else the base model itself.
+        # Overwrite args.adapter_path so all downstream calls (make_index_config etc.) see it.
+        args.adapter_path = args.adapter_path if args.adapter_path else args.base_model
+        ensure_adapter_config(Path(args.adapter_path), args.base_model)
 
-    pool_path = pool_source
-    query_path = query_source
-    if args.tokenization_mode == "finetune_raw":
-        tokenizer_name = args.adapter_path if Path(args.adapter_path).exists() else args.base_model
-        pool_path = build_finetune_aligned_dataset(
-            src_path=pool_source,
-            dst_path=pretokenized_root / args.pool_split,
-            tokenizer_name=tokenizer_name,
-            max_length=args.token_batch_size,
+        pool_path = pool_source
+        query_path = query_source
+        if args.tokenization_mode == "finetune_raw":
+            tokenizer_name = args.adapter_path if Path(args.adapter_path).exists() else args.base_model
+            pool_path = build_finetune_aligned_dataset(
+                src_path=pool_source,
+                dst_path=pretokenized_root / args.pool_split,
+                tokenizer_name=tokenizer_name,
+                max_length=args.token_batch_size,
+            )
+            query_path = build_finetune_aligned_dataset(
+                src_path=query_source,
+                dst_path=pretokenized_root / args.query_split,
+                tokenizer_name=tokenizer_name,
+                max_length=args.token_batch_size,
+            )
+
+        use_query_pre = args.preconditioning_mode in {"query", "mixed"}
+        if args.score_mode == "nearest":
+            run_build(query_path, query_run, args, compute_preconditioners=use_query_pre)
+        else:
+            run_reduce(query_path, query_run, args, compute_preconditioners=use_query_pre)
+
+        if args.preconditioning_mode == "mixed":
+            run_reduce(pool_path, pool_pre, args, compute_preconditioners=True)
+
+        run_score(
+            pool_path=pool_path,
+            query_run=query_run,
+            pool_preconditioner_run=pool_pre if args.preconditioning_mode == "mixed" else None,
+            score_run=score_run,
+            args=args,
         )
-        query_path = build_finetune_aligned_dataset(
-            src_path=query_source,
-            dst_path=pretokenized_root / args.query_split,
-            tokenizer_name=tokenizer_name,
-            max_length=args.token_batch_size,
-        )
-
-    use_query_pre = args.preconditioning_mode in {"query", "mixed"}
-    if args.score_mode == "nearest":
-        run_build(query_path, query_run, args, compute_preconditioners=use_query_pre)
-    else:
-        run_reduce(query_path, query_run, args, compute_preconditioners=use_query_pre)
-
-    if args.preconditioning_mode == "mixed":
-        run_reduce(pool_path, pool_pre, args, compute_preconditioners=True)
-
-    run_score(
-        pool_path=pool_path,
-        query_run=query_run,
-        pool_preconditioner_run=pool_pre if args.preconditioning_mode == "mixed" else None,
-        score_run=score_run,
-        args=args,
-    )
 
     scores = get_score_vector(score_run, args.score_mode)
     pool_ds = load_from_disk(str(pool_source))

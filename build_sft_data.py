@@ -40,8 +40,10 @@ CONFIG = {
     "train_size": 100_000,
     "val_size": 5_000,
     "attr_pool_size": 50_000,
-    # Attribution query: number of benchmark examples per task
-    "query_per_task": 512,
+    # Attribution query composition
+    "query_smol_size": 1024,  # smol-magpie-ultra examples (fresh, past raw_rows_consumed)
+    "query_gsm8k_size": 0,    # GSM8K train reasoning traces (set >0 to enable)
+    "query_arc_size": 0,      # ARC-Challenge for factual grounding (set >0 to enable)
     "output_dir": "runs/smoltalk_v1",
     "seed": 42,
 }
@@ -179,53 +181,94 @@ def _arc_row_to_instruct(row: dict, tokenizer: Any, max_length: int) -> dict | N
     return tok_out
 
 
-def _winogrande_row_to_instruct(row: dict, tokenizer: Any, max_length: int) -> dict | None:
-    """Convert one WinoGrande row to an instruct-formatted attribution example."""
-    sentence = row["sentence"]
-    opt1 = row["option1"]
-    opt2 = row["option2"]
+def _gsm8k_row_to_instruct(row: dict, tokenizer: Any, max_length: int) -> dict | None:
+    """Convert one GSM8K row to an instruct example.
 
-    user_text = f"Fill in the blank with the most appropriate option.\n\nSentence: {sentence}\n\nA) {opt1}\nB) {opt2}"
-    assistant_text = "A" if row["answer"] == "1" else "B"
-
+    The answer field contains the full step-by-step solution ending with '#### <number>',
+    which is exactly the reasoning trace we want as the supervised completion.
+    """
     messages = [
-        {"role": "user", "content": user_text},
-        {"role": "assistant", "content": assistant_text},
+        {"role": "user", "content": row["question"]},
+        {"role": "assistant", "content": row["answer"]},
     ]
     tok_out = _mask_prompt(messages, tokenizer, max_length)
     return tok_out
 
 
-def build_attr_query(tokenizer: Any, cfg: dict) -> Dataset:
-    """Build attribution query set from ARC-Challenge + WinoGrande."""
-    n = cfg["query_per_task"]
+def build_attr_query(tokenizer: Any, cfg: dict, raw_rows_consumed: int) -> Dataset:
+    """Build attribution query: smol-magpie-ultra (fresh rows) + GSM8K + ARC-Challenge.
+
+    smol-magpie-ultra: high-quality instruction data — the core quality signal.
+      Streamed from SmolTalk 'all' past raw_rows_consumed, guaranteeing no overlap
+      with train/val/pool splits.
+    GSM8K train: multi-step reasoning traces — selects for reasoning capability.
+    ARC-Challenge train: factual grounding — keeps some short Q&A signal.
+    """
     rows: list[dict] = []
 
-    print("Building attribution query: ARC-Challenge ...")
-    arc = load_dataset("allenai/ai2_arc", "ARC-Challenge", split="train")
-    for row in arc:
-        tok_out = _arc_row_to_instruct(row, tokenizer, cfg["max_length"])
-        if tok_out is not None:
-            tok_out["magpie_score"] = 0.0
-            rows.append(tok_out)
-        if len(rows) >= n:
+    # --- smol-magpie-ultra: stream fresh rows past the consumed offset ---
+    n_smol = cfg["query_smol_size"]
+    print(f"Building attribution query: smol-magpie-ultra (skipping {raw_rows_consumed:,} rows) ...")
+    raw = load_dataset(cfg["dataset_name"], cfg["dataset_config"], split="train", streaming=True)
+    raw_seen = 0
+    smol_rows: list[dict] = []
+    for row in raw:
+        raw_seen += 1
+        if raw_seen <= raw_rows_consumed:
+            if raw_seen % 100_000 == 0:
+                print(f"  skipping... {raw_seen:,}/{raw_rows_consumed:,}", flush=True)
+            continue
+        if row.get("source") != "smol-magpie-ultra":
+            continue
+        messages = row.get("messages") or row.get("conversations") or []
+        if not messages:
+            continue
+        tok_out = _mask_prompt(messages, tokenizer, cfg["max_length"])
+        if tok_out is None:
+            continue
+        tok_out["magpie_score"] = _get_magpie_score(row)
+        smol_rows.append(tok_out)
+        if len(smol_rows) >= n_smol:
             break
-    arc_count = len(rows)
-    print(f"  {arc_count} ARC examples")
+    if len(smol_rows) < n_smol:
+        print(f"  WARNING: only found {len(smol_rows)} smol-magpie-ultra rows (wanted {n_smol})")
+    print(f"  {len(smol_rows)} smol-magpie-ultra examples")
+    rows.extend(smol_rows)
 
-    print("Building attribution query: WinoGrande ...")
-    wino = load_dataset("allenai/winogrande", "winogrande_xl", split="train", trust_remote_code=True)
-    wino_rows: list[dict] = []
-    for row in wino:
-        tok_out = _winogrande_row_to_instruct(row, tokenizer, cfg["max_length"])
-        if tok_out is not None:
-            tok_out["magpie_score"] = 0.0
-            wino_rows.append(tok_out)
-        if len(wino_rows) >= n:
-            break
-    print(f"  {len(wino_rows)} WinoGrande examples")
-    rows.extend(wino_rows)
+    # --- GSM8K: multi-step reasoning traces (optional) ---
+    gsm_rows: list[dict] = []
+    n_gsm = cfg["query_gsm8k_size"]
+    if n_gsm > 0:
+        print(f"Building attribution query: GSM8K train ({n_gsm} examples) ...")
+        gsm = load_dataset("openai/gsm8k", "main", split="train")
+        for row in gsm:
+            tok_out = _gsm8k_row_to_instruct(row, tokenizer, cfg["max_length"])
+            if tok_out is not None:
+                tok_out["magpie_score"] = 0.0
+                gsm_rows.append(tok_out)
+            if len(gsm_rows) >= n_gsm:
+                break
+        print(f"  {len(gsm_rows)} GSM8K examples")
+        rows.extend(gsm_rows)
 
+    # --- ARC-Challenge: factual grounding (optional) ---
+    arc_rows: list[dict] = []
+    n_arc = cfg["query_arc_size"]
+    if n_arc > 0:
+        print(f"Building attribution query: ARC-Challenge train ({n_arc} examples) ...")
+        arc = load_dataset("allenai/ai2_arc", "ARC-Challenge", split="train")
+        for row in arc:
+            tok_out = _arc_row_to_instruct(row, tokenizer, cfg["max_length"])
+            if tok_out is not None:
+                tok_out["magpie_score"] = 0.0
+                arc_rows.append(tok_out)
+            if len(arc_rows) >= n_arc:
+                break
+        print(f"  {len(arc_rows)} ARC-Challenge examples")
+        rows.extend(arc_rows)
+
+    total = len(rows)
+    print(f"  attr_query total: {total} examples ({len(smol_rows)} smol + {len(gsm_rows)} GSM8K + {len(arc_rows)} ARC)")
     return Dataset.from_list(rows)
 
 
@@ -238,7 +281,9 @@ SMOKE_CONFIG = {
     "train_size": 64,
     "val_size": 20,
     "attr_pool_size": 50,
-    "query_per_task": 20,
+    "query_smol_size": 40,
+    "query_gsm8k_size": 0,
+    "query_arc_size": 0,
     "output_dir": "runs/smoke_test",
 }
 
@@ -264,7 +309,7 @@ def main() -> None:
         tokenizer.pad_token = tokenizer.eos_token
 
     train_ds, val_ds, attr_pool_ds, raw_rows_consumed = build_smoltalk_splits(tokenizer, cfg)
-    query_ds = build_attr_query(tokenizer, cfg)
+    query_ds = build_attr_query(tokenizer, cfg, raw_rows_consumed)
 
     # Save splits
     splits_info: dict[str, dict] = {}
