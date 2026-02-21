@@ -2,25 +2,23 @@ from __future__ import annotations
 
 """Evaluation wrapper using lm-eval harness.
 
-Works for both base (non-instruct) and SFT-adapted models:
-  - MC tasks (arc_challenge, arc_easy, hellaswag, winogrande, piqa, mmlu)
-    use log-probability scoring — no instruction following required.
-  - Generation tasks (gsm8k_cot_zeroshot) require some instruction following;
-    best reserved for models after SFT.
+Works for both base and LoRA SFT-adapted models. MC tasks use log-prob scoring.
+For SFT models, pass --apply-chat-template to wrap prompts in the model's chat
+template before scoring — this is required for accurate instruct model evaluation.
 
 Typical usage:
 
-  # Phase-1: score the pretrained base model on MC benchmarks
+  # Base model (no chat template)
   uv run eval_harness.py \\
-    --base-model runs/pretrain_270m_v1 \\
-    --output-json runs/pretrain_270m_v1/eval_harness.json
+    --base-model google/gemma-3-270m \\
+    --output-json runs/base_eval.json
 
-  # Phase-3: score SFT-adapted model (adapter on top of base)
+  # LoRA SFT model (chat template required)
   uv run eval_harness.py \\
-    --base-model google/gemma-3-1b-it \\
-    --adapter-path runs/gsm8k_1b_full_v1/adapter \\
-    --tasks arc_challenge,arc_easy,hellaswag,winogrande,piqa,gsm8k_cot_zeroshot \\
-    --output-json runs/gsm8k_1b_full_v1/eval_harness.json
+    --base-model google/gemma-3-270m \\
+    --adapter-path runs/smoltalk_v1/adapter \\
+    --apply-chat-template \\
+    --output-json runs/smoltalk_v1/eval.json
 """
 
 import argparse
@@ -30,9 +28,10 @@ from pathlib import Path
 import lm_eval
 import torch
 
-# Default benchmark suite for pretraining evaluation.
-# All tasks use log-prob scoring — no generation needed.
-DEFAULT_TASKS = "arc_challenge,arc_easy,hellaswag,winogrande,piqa"
+# Default benchmark suite for SFT evaluation.
+# All tasks use log-prob MC scoring — no generation needed.
+# mmlu is a group task (57 subjects); it's slow but gives broad coverage.
+DEFAULT_TASKS = "arc_challenge,arc_easy,hellaswag,winogrande,mmlu"
 
 # Metric keys lm-eval uses per task (in priority order).
 _METRIC_PRIORITY = [
@@ -59,12 +58,23 @@ def build_model_args(args: argparse.Namespace) -> str:
     parts = [f"pretrained={args.base_model}"]
     if args.adapter_path:
         parts.append(f"peft={args.adapter_path}")
+        # Use the IT tokenizer saved alongside the adapter (has chat_template).
+        # Essential when base model is google/gemma-3-270m (no chat_template).
+        parts.append(f"tokenizer={args.adapter_path}")
     # Do NOT pass torch_dtype/dtype here — lm-eval's HFLM.__init__ has its own
     # dtype="auto" parameter which (after patching huggingface.py) correctly
     # maps to torch_dtype= in from_pretrained. Passing it again causes a
     # "multiple values for keyword argument 'torch_dtype'" error.
     parts.append("attn_implementation=eager")
     return ",".join(parts)
+
+
+def build_eval_kwargs(args: argparse.Namespace) -> dict:
+    """Extra kwargs to pass to lm_eval.simple_evaluate based on flags."""
+    kwargs: dict = {}
+    if args.apply_chat_template:
+        kwargs["apply_chat_template"] = True
+    return kwargs
 
 
 def run(args: argparse.Namespace) -> None:
@@ -84,6 +94,7 @@ def run(args: argparse.Namespace) -> None:
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
+    extra = build_eval_kwargs(args)
     results = lm_eval.simple_evaluate(  # type: ignore[call-arg]
         model="hf",
         model_args=model_args,
@@ -92,6 +103,7 @@ def run(args: argparse.Namespace) -> None:
         limit=limit,
         device=device,
         batch_size=args.batch_size,
+        **extra,
     )
     if results is None:
         raise RuntimeError("lm_eval.simple_evaluate returned None — check task names and model args.")
@@ -107,6 +119,7 @@ def run(args: argparse.Namespace) -> None:
     output = {
         "base_model": args.base_model,
         "adapter_path": args.adapter_path,
+        "apply_chat_template": args.apply_chat_template,
         "tasks": tasks,
         "num_fewshot": num_fewshot,
         "limit": limit,
@@ -139,7 +152,7 @@ def make_parser() -> argparse.ArgumentParser:
         "--base-model",
         type=str,
         default="google/gemma-3-270m",
-        help="HuggingFace model ID or local path (pretrained checkpoint or hub model).",
+        help="HuggingFace base model ID or local path.",
     )
     parser.add_argument(
         "--adapter-path",
@@ -170,6 +183,13 @@ def make_parser() -> argparse.ArgumentParser:
         "--batch-size",
         type=int,
         default=8,
+    )
+    parser.add_argument(
+        "--apply-chat-template",
+        action="store_true",
+        default=False,
+        help="Wrap benchmark prompts in the model's chat template before scoring. "
+             "Required for accurate instruct/SFT model evaluation.",
     )
     parser.add_argument(
         "--output-json",

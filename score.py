@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import json
 import shutil
-from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -13,8 +12,7 @@ from bergson.data import load_scores
 from bergson.reduce import reduce
 from bergson.score.score import score_dataset
 from datasets import Dataset, load_from_disk
-from transformers import AutoTokenizer
-from transformers import AutoConfig
+from transformers import AutoConfig, AutoTokenizer
 
 
 def remove_path(path: Path) -> None:
@@ -209,17 +207,19 @@ def write_row_diagnostics(
         if "loss" in score_data_ds.column_names
         else np.zeros(len(pool_ds), dtype=np.float32)
     )
+    magpie_scores = (
+        np.asarray(pool_ds["magpie_score"], dtype=np.float32)
+        if "magpie_score" in pool_ds.column_names
+        else np.zeros(len(pool_ds), dtype=np.float32)
+    )
 
     rows = []
     for i in range(len(pool_ds)):
-        row = pool_ds[int(i)]
         rows.append(
             {
                 "index": int(i),
-                "row_id": str(row.get("row_id", i)),
                 "score": float(scores[i]),
-                "pair_key": str(row.get("pair_key", "")),
-                "outcome": str(row.get("outcome", "")),
+                "magpie_score": float(magpie_scores[i]),
                 "length_tokens": int(lengths[i]),
                 "loss": float(losses[i]),
             }
@@ -232,16 +232,11 @@ def write_row_diagnostics(
     return rows
 
 
-def topk_counts(rows: list[dict], key: str, k: int) -> dict[str, int]:
-    ranked = sorted(rows, key=lambda r: r["score"], reverse=True)[: min(k, len(rows))]
-    counts = Counter(str(row.get(key, "")) for row in ranked)
-    return dict(sorted(counts.items(), key=lambda x: (-x[1], x[0])))
-
-
 def write_summary(rows: list[dict], out_path: Path) -> None:
     scores = np.asarray([r["score"] for r in rows], dtype=np.float32)
     lengths = np.asarray([r["length_tokens"] for r in rows], dtype=np.float32)
     losses = np.asarray([r["loss"] for r in rows], dtype=np.float32)
+    magpie = np.asarray([r["magpie_score"] for r in rows], dtype=np.float32)
 
     summary = {
         "rows": len(rows),
@@ -257,14 +252,7 @@ def write_summary(rows: list[dict], out_path: Path) -> None:
         "correlations": {
             "score_vs_length": safe_corr(scores, lengths),
             "score_vs_loss": safe_corr(scores, losses),
-        },
-        "top_k_composition": {
-            "k50_pair_key": topk_counts(rows, "pair_key", 50),
-            "k100_pair_key": topk_counts(rows, "pair_key", 100),
-            "k200_pair_key": topk_counts(rows, "pair_key", 200),
-            "k50_outcome": topk_counts(rows, "outcome", 50),
-            "k100_outcome": topk_counts(rows, "outcome", 100),
-            "k200_outcome": topk_counts(rows, "outcome", 200),
+            "score_vs_magpie": safe_corr(scores, magpie),
         },
     }
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -302,43 +290,30 @@ def build_subsets(
         else np.zeros(n, dtype=np.float32)
     )
     length_bins = compute_length_bins(lengths)
-    outcomes = [str(x) for x in pool_ds["outcome"]]
 
-    top_strata = Counter((outcomes[i], int(length_bins[i])) for i in top_idx)
+    # Stratify random baseline by length bin only (seq_len is the dominant
+    # confound in attribution scores, so we control for it explicitly).
+    from collections import Counter
+    top_strata = Counter(int(length_bins[i]) for i in top_idx)
     remaining = set(available)
     random_idx: list[int] = []
 
-    for (outcome, length_bin), target_count in top_strata.items():
-        exact_pool = [
-            i
-            for i in remaining
-            if outcomes[i] == outcome and int(length_bins[i]) == int(length_bin)
-        ]
-        exact_take = min(target_count, len(exact_pool))
-        if exact_take > 0:
-            chosen = rng.choice(exact_pool, size=exact_take, replace=False).tolist()
+    for length_bin, target_count in top_strata.items():
+        bin_pool = [i for i in remaining if int(length_bins[i]) == length_bin]
+        take = min(target_count, len(bin_pool))
+        if take > 0:
+            chosen = rng.choice(bin_pool, size=take, replace=False).tolist()
             random_idx.extend(int(i) for i in chosen)
             for i in chosen:
                 remaining.remove(int(i))
 
-        if exact_take < target_count:
-            outcome_pool = [i for i in remaining if outcomes[i] == outcome]
-            need = target_count - exact_take
-            take = min(need, len(outcome_pool))
-            if take > 0:
-                chosen = rng.choice(outcome_pool, size=take, replace=False).tolist()
-                random_idx.extend(int(i) for i in chosen)
-                for i in chosen:
-                    remaining.remove(int(i))
-
+    # Fill any remaining slots uniformly at random
     if len(random_idx) < k:
-        need = k - len(random_idx)
         pool = list(remaining)
-        if need > 0 and pool:
-            chosen = rng.choice(pool, size=min(need, len(pool)), replace=False).tolist()
+        need = min(k - len(random_idx), len(pool))
+        if need > 0:
+            chosen = rng.choice(pool, size=need, replace=False).tolist()
             random_idx.extend(int(i) for i in chosen)
-            for i in chosen:
-                remaining.remove(int(i))
 
     if len(random_idx) > k:
         random_idx = random_idx[:k]
@@ -387,7 +362,7 @@ def main() -> None:
     parser.add_argument("--query-split", type=str, default="attr_query")
     parser.add_argument("--adapter-path", type=str, default=None,
                         help="PEFT adapter path. If omitted, --base-model is used directly.")
-    parser.add_argument("--base-model", type=str, default="google/gemma-3-1b-it")
+    parser.add_argument("--base-model", type=str, default="google/gemma-3-270m")
     parser.add_argument("--output-dir", type=str, default="runs/smoltalk_v1/attribution")
     parser.add_argument("--token-batch-size", type=int, default=1024)
     parser.add_argument("--projection-dim", type=int, default=32)
