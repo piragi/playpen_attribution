@@ -24,13 +24,13 @@ from sae_lens import SAE
 from transformers import AutoModelForCausalLM
 
 CONFIG = {
-    "base_model": "google/gemma-3-270m",
-    "sae_release": "gemma-scope-2-270m-pt-res",
-    "sae_id": "layer_12_width_16k_l0_small",
+    "base_model": "google/gemma-3-1b-pt",
+    "sae_release": "gemma-scope-2-1b-pt-res",  # verify exact release name in sae_lens
+    "sae_id": "layer_12_width_16k_l0_small",   # verify sae_id for 1B
     "layer_idx": 12,
-    "diagnostics_path": "runs/pretrain_attribution_v2/attribution_mean/row_diagnostics.jsonl",
-    "pool_path": "runs/pretrain_attribution_v2/data/score_pool",
-    "output_dir": "runs/pretrain_attribution_v2/sae_features/layer12_width16k",
+    "diagnostics_path": "runs/smoltalk_v1/scores/row_diagnostics.jsonl",
+    "pool_path": "runs/smoltalk_v1/data/attr_pool",
+    "output_dir": "runs/smoltalk_v1/sae_features/layer12_width16k",
     "top_frac": 0.10,
     "bottom_frac": 0.10,
     "topk_features": 256,

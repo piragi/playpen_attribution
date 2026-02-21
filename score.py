@@ -362,7 +362,7 @@ def main() -> None:
     parser.add_argument("--query-split", type=str, default="attr_query")
     parser.add_argument("--adapter-path", type=str, default=None,
                         help="PEFT adapter path. If omitted, --base-model is used directly.")
-    parser.add_argument("--base-model", type=str, default="google/gemma-3-270m")
+    parser.add_argument("--base-model", type=str, default="google/gemma-3-1b-pt")
     parser.add_argument("--output-dir", type=str, default="runs/smoltalk_v1/attribution")
     parser.add_argument("--token-batch-size", type=int, default=1024)
     parser.add_argument("--projection-dim", type=int, default=32)

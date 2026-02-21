@@ -33,13 +33,13 @@ from transformers import AutoTokenizer
 CONFIG = {
     "dataset_name": "HuggingFaceTB/smoltalk",
     "dataset_config": "all",  # full SmolTalk mix; use "smol-magpie-ultra" for smaller/faster
-    "base_model": "google/gemma-3-270m",      # model weights for training
-    "tokenizer_model": "google/gemma-3-270m-it",  # tokenizer for chat template (same vocab)
+    "base_model": "google/gemma-3-1b-pt",      # model weights for training
+    "tokenizer_model": "google/gemma-3-1b-it",  # tokenizer for chat template (same vocab)
     "max_length": 1024,
     # Split sizes (rows, not tokens)
-    "train_size": 50_000,
-    "val_size": 2_000,
-    "attr_pool_size": 20_000,
+    "train_size": 100_000,
+    "val_size": 5_000,
+    "attr_pool_size": 50_000,
     # Attribution query: number of benchmark examples per task
     "query_per_task": 512,
     "output_dir": "runs/smoltalk_v1",

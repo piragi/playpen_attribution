@@ -26,7 +26,7 @@ from peft import LoraConfig, PeftConfig, PeftModel, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer, DataCollatorForSeq2Seq, Trainer, TrainingArguments
 
 CONFIG = {
-    "base_model": "google/gemma-3-270m",  # base model weights: larger gradient variance, matches GemmaScope SAE distribution
+    "base_model": "google/gemma-3-1b-pt",  # base model weights: larger gradient variance, matches GemmaScope SAE distribution
     "train_data": "runs/smoltalk_v1/data/train",
     "val_data": "runs/smoltalk_v1/data/val",
     "output_dir": "runs/smoltalk_v1/adapter",
@@ -36,8 +36,8 @@ CONFIG = {
     "warmup_ratio": 0.03,
     "weight_decay": 0.01,
     "lr_scheduler_type": "cosine",
-    "per_device_train_batch_size": 1,
-    "gradient_accumulation_steps": 16,
+    "per_device_train_batch_size": 4,
+    "gradient_accumulation_steps": 8,
     "logging_steps": 20,
     "save_steps": 500,
     "save_total_limit": 2,
@@ -103,8 +103,11 @@ def run_train(args: argparse.Namespace) -> None:
 
     # Always use the IT tokenizer for its chat template.
     # If resuming from an adapter that already has the IT tokenizer saved, load from there.
-    # Otherwise fall back to google/gemma-3-270m-it (same vocab as base, adds chat_template).
-    it_tokenizer_source = tokenizer_source if args.resume_adapter else "google/gemma-3-270m-it"
+    # Otherwise derive IT model name from base: strip -pt suffix, append -it.
+    # e.g. google/gemma-3-1b-pt → google/gemma-3-1b-it
+    #      google/gemma-3-270m   → google/gemma-3-270m-it
+    it_model = args.base_model.replace("-pt", "") + "-it"
+    it_tokenizer_source = tokenizer_source if args.resume_adapter else it_model
     tokenizer = AutoTokenizer.from_pretrained(it_tokenizer_source)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token

@@ -151,7 +151,7 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--base-model",
         type=str,
-        default="google/gemma-3-270m",
+        default="google/gemma-3-1b-pt",
         help="HuggingFace base model ID or local path.",
     )
     parser.add_argument(

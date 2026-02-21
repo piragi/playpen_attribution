@@ -25,10 +25,10 @@ from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader, Dataset, random_split
 
 CONFIG = {
-    "sae_features_dir": "runs/pretrain_attribution_v2/sae_features/layer12_width16k",
+    "sae_features_dir": "runs/smoltalk_v1/sae_features/layer12_width16k",
     "sae_id": "layer_12_width_16k_l0_small",
     "d_sae": 16384,
-    "output_dir": "runs/pretrain_attribution_v2/sae_classifier",
+    "output_dir": "runs/smoltalk_v1/sae_classifier",
     # Model hyperparameters
     "d_embed": 64,
     "d_hidden": 128,
