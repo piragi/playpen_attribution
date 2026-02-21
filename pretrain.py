@@ -5,7 +5,7 @@ import math
 from pathlib import Path
 from typing import Iterator
 import torch
-from datasets import Dataset, load_dataset
+from datasets import Dataset, load_dataset, load_from_disk
 from torch.optim.lr_scheduler import LambdaLR
 from transformers import (
     AutoModelForCausalLM,
@@ -92,7 +92,16 @@ def run(args: argparse.Namespace) -> None:
     tokenizer = AutoTokenizer.from_pretrained(args.base_model)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    train_ds = build_packed_dataset(args, tokenizer)
+    if args.dataset_path:
+        print(f"Loading dataset from disk: {args.dataset_path}")
+        train_ds = load_from_disk(args.dataset_path)
+        # Keep only input_ids — collator creates labels by shifting
+        extra = [c for c in train_ds.column_names if c != "input_ids"]
+        if extra:
+            train_ds = train_ds.remove_columns(extra)
+        print(f"  Loaded {len(train_ds):,} chunks")
+    else:
+        train_ds = build_packed_dataset(args, tokenizer)
     if len(train_ds) == 0:
         raise RuntimeError("No packed chunks — check --max-tokens and dataset availability.")
     use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
@@ -176,6 +185,13 @@ def make_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--base-model", type=str, default="google/gemma-3-270m")
     parser.add_argument("--output-dir", type=str, default="runs/pretrain_270m_v1")
+    parser.add_argument(
+        "--dataset-path",
+        type=str,
+        default=None,
+        help="Path to a saved HF dataset (load_from_disk). "
+             "If set, skips FineWeb streaming and trains on this dataset directly.",
+    )
     # Dataset — using raw FineWeb (not FineWeb-Edu) to preserve quality variance.
     # CC-MAIN-2024-10 is a recent, high-quality dump recommended by the FineWeb team.
     parser.add_argument("--dataset-name", type=str, default="HuggingFaceFW/fineweb")
@@ -195,15 +211,15 @@ def make_parser() -> argparse.ArgumentParser:
         help="Packed sequence length for each training chunk.",
     )
     # Optimiser / schedule
-    parser.add_argument("--learning-rate", type=float, default=1e-4)
+    parser.add_argument("--learning-rate", type=float, default=3e-5)
     parser.add_argument(
         "--min-learning-rate",
         type=float,
-        default=1e-5,
+        default=3e-6,
         help="Cosine schedule decays to this floor LR.",
     )
-    parser.add_argument("--warmup-steps", type=int, default=500)
-    parser.add_argument("--weight-decay", type=float, default=0.1)
+    parser.add_argument("--warmup-steps", type=int, default=200)
+    parser.add_argument("--weight-decay", type=float, default=0.01)
     # Batch / hardware
     parser.add_argument("--per-device-train-batch-size", type=int, default=1)
     parser.add_argument(

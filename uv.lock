@@ -1688,7 +1688,7 @@ requires-dist = [
     { name = "lm-eval", specifier = ">=0.4.0" },
     { name = "openai" },
     { name = "peft", specifier = ">=0.18.1" },
-    { name = "sae-lens", specifier = ">=6.36.0" },
+    { name = "sae-lens" },
     { name = "torch", specifier = ">=2.10.0" },
     { name = "transformers", specifier = ">=4.55.0,<4.56.0" },
     { name = "trl", specifier = ">=0.22,<0.23" },
@@ -2242,7 +2242,7 @@ wheels = [
 
 [[package]]
 name = "sae-lens"
-version = "6.36.2"
+version = "6.37.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "babe" },
@@ -2259,9 +2259,9 @@ dependencies = [
     { name = "transformers" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/74/4b/7fc2fd7708cc65b3f439cd557f04628249c276cfb47874d6f1df7cfa2f0e/sae_lens-6.36.2.tar.gz", hash = "sha256:2a3be0fac25073aaa4d144913c2a9235d61c7d666ee94158d936612f64ed315b", size = 253090 }
+sdist = { url = "https://files.pythonhosted.org/packages/8f/cb/77ccb27066e091a2070b98307dc8c1e7f60923a47e9b8eb28528dc715042/sae_lens-6.37.2.tar.gz", hash = "sha256:688a1a985eee39eda0715b4e1ab39a28bfd108494bcfb0d706879f0bea6e9f6f", size = 254263 }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/d7/a0/bf9c1ab3ebd6c6eb03fb6d6ac797e5a512b94965959e204e160a44d2ee04/sae_lens-6.36.2-py3-none-any.whl", hash = "sha256:b72d950bbdba29c5e5d50af1c5efbf4168fa1e38b495045c86b8500a5a56f95d", size = 287024 },
+    { url = "https://files.pythonhosted.org/packages/45/d0/ac1ca9cf6b8d54fd56c59b4c0eebf361011f0c6ebd57d938eb5046bfd22c/sae_lens-6.37.2-py3-none-any.whl", hash = "sha256:0543cbacbde324c37cea10b18d6218c76feed89122215638958bdb684d317338", size = 288209 },
 ]
 
 [[package]]

@@ -40,13 +40,13 @@ from transformers import AutoTokenizer
 
 CONFIG = {
     # Output
-    "run_dir": "runs/pretrain_attribution_v1",
+    "run_dir": "runs/pretrain_attribution_v2",
     # Pretrained model + tokenizer (full checkpoint, not PEFT)
-    "base_model": "runs/pretrain_270m_v1",
+    "base_model": "runs/pretrain_270m_v2",
     # FineWeb pool — identical parameters to the pretrain.py run
     "fineweb_dataset": "HuggingFaceFW/fineweb",
     "fineweb_config": "CC-MAIN-2024-10",
-    "fineweb_max_tokens": 100_000_000,
+    "fineweb_max_tokens": 200_000_000,
     "chunk_size": 1024,           # must match pretrain.py --max-length
     "pool_progress_every": 5_000,
     # Benchmark query
@@ -79,42 +79,49 @@ def token_stream(dataset, tokenizer, max_tokens: int) -> Iterator[list[int]]:
 
 
 def build_fineweb_pool(cfg: dict, tokenizer) -> Dataset:
-    print(f"Streaming {cfg['fineweb_dataset']}/{cfg['fineweb_config']} ...")
-    raw = load_dataset(
-        cfg["fineweb_dataset"],
-        cfg["fineweb_config"],
-        split="train",
-        streaming=True,
-    )
+    """Stream FineWeb, tokenize, pack into chunks via a generator.
 
-    buffer: list[int] = []
-    rows: list[dict] = []
+    Uses Dataset.from_generator() to avoid holding ~195K Python dicts in memory
+    (~11GB) — the Arrow writer processes rows one at a time and writes to disk.
+    """
     chunk_size = cfg["chunk_size"]
     every = cfg["pool_progress_every"]
 
-    for ids in token_stream(raw, tokenizer, cfg["fineweb_max_tokens"]):
-        buffer.extend(ids)
-        while len(buffer) >= chunk_size:
-            chunk = buffer[:chunk_size]
-            buffer = buffer[chunk_size:]
-            idx = len(rows)
-            rows.append({
-                "row_id": f"fineweb-{idx}",
-                "input_ids": chunk,
-                "labels": list(chunk),   # full causal supervision
-                "length": chunk_size,
-                "outcome": "",           # required by score.py build_subsets
-                "pair_key": "",
-            })
-            if idx > 0 and idx % every == 0:
-                print(
-                    f"\r  packed {idx:,} chunks "
-                    f"({idx * chunk_size / 1e6:.1f}M tokens)",
-                    end="", flush=True,
-                )
+    def _gen():
+        print(f"Streaming {cfg['fineweb_dataset']}/{cfg['fineweb_config']} ...")
+        raw = load_dataset(
+            cfg["fineweb_dataset"],
+            cfg["fineweb_config"],
+            split="train",
+            streaming=True,
+        )
+        buffer: list[int] = []
+        idx = 0
+        for ids in token_stream(raw, tokenizer, cfg["fineweb_max_tokens"]):
+            buffer.extend(ids)
+            while len(buffer) >= chunk_size:
+                chunk = buffer[:chunk_size]
+                buffer = buffer[chunk_size:]
+                if idx > 0 and idx % every == 0:
+                    print(
+                        f"\r  packed {idx:,} chunks "
+                        f"({idx * chunk_size / 1e6:.1f}M tokens)",
+                        end="", flush=True,
+                    )
+                yield {
+                    "row_id": f"fineweb-{idx}",
+                    "input_ids": chunk,
+                    "labels": list(chunk),
+                    "length": chunk_size,
+                    "outcome": "",
+                    "pair_key": "",
+                }
+                idx += 1
+        print(f"\nBuilt {idx:,} FineWeb pool chunks × {chunk_size} tokens")
 
-    print(f"\nBuilt {len(rows):,} FineWeb pool chunks × {chunk_size} tokens")
-    return Dataset.from_list(rows)
+    ds: Dataset = Dataset.from_generator(_gen)  # type: ignore[assignment]
+    print(f"  {len(ds):,} pool chunks materialized")
+    return ds
 
 
 # ---------------------------------------------------------------------------

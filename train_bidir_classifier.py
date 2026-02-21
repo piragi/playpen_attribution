@@ -1,391 +1,311 @@
 from __future__ import annotations
 
-import argparse
+"""SAE fingerprint classifier: predict high vs low attribution from SAE features.
+
+Architecture: mean-pooled set encoder over top-K (feature_id, activation) pairs.
+  embed(feat_id) * feat_val  →  Linear+GELU+Dropout  →  masked mean  →  head
+
+Runs two ablation sweeps:
+  K ablation: K ∈ {64, 128, 256, 512}   — how many top features are needed
+  Baselines A/B for reference
+
+Usage:
+    uv run train_bidir_classifier.py
+"""
+
 import json
-from collections import defaultdict
-from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
-from bergson.data import load_scores
-from datasets import load_from_disk
+import torch
+import torch.nn as nn
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import roc_auc_score
+from sklearn.preprocessing import StandardScaler
+from torch.utils.data import DataLoader, Dataset, random_split
+
+CONFIG = {
+    "sae_features_dir": "runs/pretrain_attribution_v2/sae_features/layer12_width16k",
+    "sae_id": "layer_12_width_16k_l0_small",
+    "d_sae": 16384,
+    "output_dir": "runs/pretrain_attribution_v2/sae_classifier",
+    # Model hyperparameters
+    "d_embed": 64,
+    "d_hidden": 128,
+    "dropout": 0.1,
+    # K ablation values to sweep
+    "k_values": [64, 128, 256, 512],
+    # Training
+    "lr": 3e-4,
+    "weight_decay": 1e-2,
+    "batch_size": 64,
+    "max_epochs": 100,
+    "patience": 10,
+    "val_frac": 0.20,
+    "seed": 42,
+}
 
 
-def load_manifest(path: str) -> dict:
-    return json.loads(Path(path).read_text())
+# ---------------------------------------------------------------------------
+# Dataset
+# ---------------------------------------------------------------------------
+
+class SAEDataset(Dataset):
+    """Loads pre-extracted SAE feature arrays from a .npz file."""
+
+    def __init__(self, npz_path: str, k: int) -> None:
+        data = np.load(npz_path)
+        # Slice to the requested K (features are already top-sorted by activation)
+        self.feat_ids = torch.from_numpy(data["feat_ids"][:, :k].astype(np.int64))
+        self.feat_vals = torch.from_numpy(data["feat_vals"][:, :k].astype(np.float32))
+        self.masks = torch.from_numpy(data["masks"][:, :k].astype(bool))
+        self.labels = torch.from_numpy(data["labels"].astype(np.float32))
+
+    def __len__(self) -> int:
+        return len(self.labels)
+
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+        return {
+            "feat_ids": self.feat_ids[idx],
+            "feat_vals": self.feat_vals[idx],
+            "mask": self.masks[idx],
+            "label": self.labels[idx],
+        }
 
 
-def split_path(manifest: dict, split_name: str) -> Path:
-    split = manifest.get("splits", {}).get(split_name)
-    if not split or "path" not in split:
-        raise KeyError(f"Split '{split_name}' not found in manifest.")
-    return Path(split["path"])
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
 
+class SAEFingerprint(nn.Module):
+    """Mean-pooled set encoder over (feature_id, activation) pairs."""
 
-def row_field(row: dict, name: str):
-    if name in row and row[name] is not None:
-        return row[name]
-    meta = row.get("meta")
-    if isinstance(meta, dict):
-        return meta.get(name)
-    return None
-
-
-def make_group_key(row: dict, fields: list[str]) -> str:
-    return "||".join(str(row_field(row, f) or "<missing>") for f in fields)
-
-
-def load_rows(path: Path, max_rows: int | None, group_fields: list[str]) -> list[dict]:
-    ds = load_from_disk(str(path))
-    limit = len(ds) if max_rows is None else min(len(ds), int(max_rows))
-    rows: list[dict] = []
-    for i in range(limit):
-        row = ds[int(i)]
-        rows.append(
-            {
-                "index": int(i),
-                "row_id": str(row.get("row_id", i)),
-                "group_key": make_group_key(row, group_fields),
-                "game": row_field(row, "game"),
-                "game_role": row_field(row, "game_role"),
-                "experiment": row_field(row, "experiment"),
-                "task_id": row_field(row, "task_id"),
-                "outcome": row_field(row, "outcome"),
-                "pair_key": row_field(row, "pair_key"),
-                "source_split": row_field(row, "source_split"),
-            }
+    def __init__(self, d_sae: int, d_embed: int, d_hidden: int, dropout: float) -> None:
+        super().__init__()
+        self.embed = nn.Embedding(d_sae, d_embed)
+        self.proj = nn.Sequential(
+            nn.Linear(d_embed, d_hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
         )
-    return rows
-
-
-def load_score_vector(score_run_path: Path) -> np.ndarray:
-    scores = load_scores(score_run_path)
-    try:
-        values = np.asarray(scores.get(slice(None), score_idx=0), dtype=np.float32)
-        if values.ndim == 2:
-            values = values[:, 0]
-    except Exception:
-        values = np.asarray(scores[:], dtype=np.float32)
-        if values.ndim == 2:
-            values = values[:, 0]
-    finite = np.isfinite(values)
-    if finite.all():
-        return values.astype(np.float32)
-    fill = float(np.nanmin(values[finite]) - 1.0) if finite.any() else -1.0
-    return np.nan_to_num(values, nan=fill, posinf=fill, neginf=fill).astype(np.float32)
-
-
-def align_scores(rows: list[dict], scores: np.ndarray, score_run_path: Path) -> np.ndarray:
-    diag_path = score_run_path.parent / "row_diagnostics.jsonl"
-    if diag_path.exists():
-        score_by_row_id: dict[str, float] = {}
-        with diag_path.open() as f:
-            for line in f:
-                if not line.strip():
-                    continue
-                rec = json.loads(line)
-                score_by_row_id[str(rec["row_id"])] = float(rec["score"])
-        missing = [row["row_id"] for row in rows if row["row_id"] not in score_by_row_id]
-        if missing:
-            raise KeyError(f"Missing scores for {len(missing)} row_ids in {diag_path}")
-        return np.asarray([score_by_row_id[row["row_id"]] for row in rows], dtype=np.float32)
-
-    max_idx = max(row["index"] for row in rows)
-    if max_idx >= len(scores):
-        raise ValueError(
-            f"Score vector too short for split indices: max_index={max_idx} scores={len(scores)}"
+        self.head = nn.Sequential(
+            nn.Linear(d_hidden, d_hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_hidden, 1),
         )
-    return np.asarray([scores[row["index"]] for row in rows], dtype=np.float32)
+
+    def forward(
+        self,
+        feat_ids: torch.Tensor,   # (B, K)
+        feat_vals: torch.Tensor,  # (B, K)
+        mask: torch.Tensor,       # (B, K) bool
+    ) -> torch.Tensor:
+        x = self.embed(feat_ids) * feat_vals.unsqueeze(-1)    # (B, K, d_embed)
+        h = self.proj(x)                                       # (B, K, d_hidden)
+        mask_f = mask.float().unsqueeze(-1)                    # (B, K, 1)
+        pooled = (h * mask_f).sum(1) / mask_f.sum(1).clamp(min=1)  # (B, d_hidden)
+        return self.head(pooled).squeeze(-1)                   # (B,)
 
 
-def rank_percentile(values: np.ndarray) -> np.ndarray:
-    n = int(values.shape[0])
-    if n <= 1:
-        return np.zeros(n, dtype=np.float32)
-    order = np.argsort(values)
-    ranks = np.empty(n, dtype=np.float32)
-    ranks[order] = np.arange(n, dtype=np.float32)
-    return ranks / float(n - 1)
+# ---------------------------------------------------------------------------
+# Training
+# ---------------------------------------------------------------------------
 
-
-def grouped_split(group_keys: list[str], test_fraction: float, seed: int) -> tuple[np.ndarray, np.ndarray]:
-    groups: dict[str, list[int]] = defaultdict(list)
-    for i, key in enumerate(group_keys):
-        groups[str(key)].append(i)
-    if len(groups) < 2:
-        return random_split(len(group_keys), test_fraction, seed)
-
-    rng = np.random.default_rng(seed)
-    ids = list(groups.keys())
-    rng.shuffle(ids)
-    n_test = int(round(len(ids) * test_fraction))
-    n_test = max(1, min(n_test, len(ids) - 1))
-    test_groups = set(ids[:n_test])
-
-    train_idx = np.asarray([i for i, k in enumerate(group_keys) if k not in test_groups], dtype=np.int64)
-    test_idx = np.asarray([i for i, k in enumerate(group_keys) if k in test_groups], dtype=np.int64)
-    if train_idx.size == 0 or test_idx.size == 0:
-        return random_split(len(group_keys), test_fraction, seed)
-    return train_idx, test_idx
-
-
-def random_split(n: int, test_fraction: float, seed: int) -> tuple[np.ndarray, np.ndarray]:
-    if n < 2:
-        raise ValueError("Need at least 2 rows to split.")
-    rng = np.random.default_rng(seed)
-    idx = np.arange(n, dtype=np.int64)
-    rng.shuffle(idx)
-    n_test = int(round(n * test_fraction))
-    n_test = max(1, min(n_test, n - 1))
-    test_idx = np.sort(idx[:n_test])
-    train_idx = np.sort(idx[n_test:])
-    return train_idx, test_idx
-
-
-def safe_corr(x: np.ndarray, y: np.ndarray) -> float | None:
-    if len(x) < 2 or len(y) < 2:
-        return None
-    sx = float(np.std(x))
-    sy = float(np.std(y))
-    if sx == 0.0 or sy == 0.0:
-        return None
-    return float(np.corrcoef(x, y)[0, 1])
-
-
-def safe_spearman(x: np.ndarray, y: np.ndarray) -> float | None:
-    return safe_corr(rank_percentile(x), rank_percentile(y))
-
-
-def regression_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
-    err = y_pred - y_true
-    mse = float(np.mean(err * err))
-    return {
-        "mse": mse,
-        "rmse": float(np.sqrt(mse)),
-        "mae": float(np.mean(np.abs(err))),
-        "pearson": safe_corr(y_true, y_pred),
-        "spearman": safe_spearman(y_true, y_pred),
-    }
-
-
-def topk_overlap(y_true: np.ndarray, y_pred: np.ndarray, k: int) -> dict:
-    n = int(y_true.shape[0])
-    k = max(1, min(int(k), n))
-    true_top = set(np.argsort(-y_true)[:k].tolist())
-    pred_top = set(np.argsort(-y_pred)[:k].tolist())
-    overlap = len(true_top & pred_top)
-    return {"k": int(k), "overlap_count": int(overlap), "overlap_fraction": float(overlap / k)}
-
-
-def project_features(x: np.ndarray, projection_dim: int, seed: int) -> np.ndarray:
-    if projection_dim <= 0 or x.shape[1] <= projection_dim:
-        return x.astype(np.float32)
-    rng = np.random.default_rng(seed)
-    proj = rng.standard_normal((x.shape[1], projection_dim), dtype=np.float32) / np.sqrt(
-        float(projection_dim)
+def train_neural(
+    model: SAEFingerprint,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    cfg: dict,
+    out_dir: Path,
+    device: str,
+) -> dict:
+    model = model.to(device)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=cfg["lr"], weight_decay=cfg["weight_decay"]
     )
-    return (x @ proj).astype(np.float32)
+    criterion = nn.BCEWithLogitsLoss()
+
+    best_auroc = -1.0
+    patience_left = cfg["patience"]
+    history: list[dict] = []
+
+    for epoch in range(cfg["max_epochs"]):
+        model.train()
+        train_loss = 0.0
+        for batch in train_loader:
+            feat_ids = batch["feat_ids"].to(device)
+            feat_vals = batch["feat_vals"].to(device)
+            mask = batch["mask"].to(device)
+            labels = batch["label"].to(device)
+
+            logits = model(feat_ids, feat_vals, mask)
+            loss = criterion(logits, labels)
+            optimizer.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            train_loss += loss.item() * len(labels)
+        train_loss /= len(train_loader.dataset)  # type: ignore[arg-type]
+
+        val_auroc, val_acc = evaluate_neural(model, val_loader, device)
+        history.append({"epoch": epoch, "train_loss": train_loss, "val_auroc": val_auroc, "val_acc": val_acc})
+
+        if val_auroc > best_auroc:
+            best_auroc = val_auroc
+            patience_left = cfg["patience"]
+            torch.save(model.state_dict(), out_dir / "best_model.pt")
+        else:
+            patience_left -= 1
+            if patience_left == 0:
+                print(f"    early stop at epoch {epoch+1}")
+                break
+
+        if (epoch + 1) % 10 == 0:
+            print(f"    epoch {epoch+1:3d}  loss={train_loss:.4f}  val_auroc={val_auroc:.4f}  val_acc={val_acc:.4f}")
+
+    model.load_state_dict(torch.load(out_dir / "best_model.pt", map_location=device))
+    val_auroc, val_acc = evaluate_neural(model, val_loader, device)
+    return {"val_auroc": val_auroc, "val_acc": val_acc, "history": history}
 
 
-def build_sae_matrix(
-    sae_dir: Path,
-    rows: list[dict],
-    projection_dim: int,
-    seed: int,
-) -> tuple[np.ndarray, dict]:
-    examples_path = sae_dir / "examples.jsonl"
-    if not examples_path.exists():
-        raise FileNotFoundError(f"Missing SAE metadata file: {examples_path}")
-    npz_files = sorted(sae_dir.glob("*.npz"))
-    if not npz_files:
-        raise FileNotFoundError(f"No .npz SAE file found in {sae_dir}")
-    npz_path = npz_files[0]
+def evaluate_neural(model: SAEFingerprint, loader: DataLoader, device: str) -> tuple[float, float]:
+    model.eval()
+    all_logits: list[float] = []
+    all_labels: list[float] = []
+    with torch.inference_mode():
+        for batch in loader:
+            feat_ids = batch["feat_ids"].to(device)
+            feat_vals = batch["feat_vals"].to(device)
+            mask = batch["mask"].to(device)
+            logits = model(feat_ids, feat_vals, mask).cpu()
+            all_logits.extend(logits.tolist())
+            all_labels.extend(batch["label"].tolist())
+
+    labels_arr = np.array(all_labels)
+    probs_arr = torch.sigmoid(torch.tensor(all_logits)).numpy()
+    auroc = float(roc_auc_score(labels_arr, probs_arr))
+    acc = float(((probs_arr >= 0.5).astype(float) == labels_arr).mean())
+    return auroc, acc
+
+
+# ---------------------------------------------------------------------------
+# Sklearn baselines (reference)
+# ---------------------------------------------------------------------------
+
+def run_baselines(npz_path: Path, train_idx: np.ndarray, val_idx: np.ndarray) -> dict:
     data = np.load(npz_path)
+    all_labels = data["labels"]
+    y_train = all_labels[train_idx].astype(float)
+    y_val = all_labels[val_idx].astype(float)
 
-    row_ids: list[str] = []
-    with examples_path.open() as f:
-        for line in f:
-            if line.strip():
-                row_ids.append(str(json.loads(line)["row_id"]))
-    row_to_idx = {rid: i for i, rid in enumerate(row_ids)}
+    results: dict[str, dict] = {}
 
-    if "sample_stats" not in data:
-        raise KeyError("SAE npz missing 'sample_stats'")
-    if "feature_activation_mean" not in data:
-        raise KeyError(
-            "SAE npz missing 'feature_activation_mean'. Re-run sae_analysis.py with activation export."
-        )
-
-    stats = np.asarray(data["sample_stats"], dtype=np.float32)
-    activation = np.asarray(data["feature_activation_mean"], dtype=np.float32)
-    activation = project_features(activation, projection_dim, seed + 17)
-    full = np.concatenate([stats, activation], axis=1)
-    dims = {
-        "sample_stats": int(stats.shape[1]),
-        "feature_activation_mean_projected": int(activation.shape[1]),
+    # A: global stats only
+    stats = data["global_stats"]
+    scaler = StandardScaler()
+    x_tr = scaler.fit_transform(stats[train_idx])
+    x_va = scaler.transform(stats[val_idx])
+    clf_a = LogisticRegression(max_iter=1000, C=1.0)
+    clf_a.fit(x_tr, y_train)
+    probs_a = clf_a.predict_proba(x_va)[:, 1]
+    results["A_logreg_stats"] = {
+        "val_auroc": float(roc_auc_score(y_val, probs_a)),
+        "val_acc": float(((probs_a >= 0.5) == y_val).mean()),
     }
-    missing = [row["row_id"] for row in rows if row["row_id"] not in row_to_idx]
-    if missing:
-        raise KeyError(f"Missing {len(missing)} row_ids in SAE artifacts.")
-    aligned = np.asarray([full[row_to_idx[row["row_id"]]] for row in rows], dtype=np.float32)
 
-    meta = {
-        "sae_dir": str(sae_dir),
-        "sae_npz": str(npz_path),
-        "sae_feature_mode": "stats+activation (locked)",
-        "sae_projection_dim": int(projection_dim),
-        "sae_feature_dims": dims,
-        "sae_total_dim": int(aligned.shape[1]),
+    # B: L1 on dense 16k sparse vector
+    feat_ids = data["feat_ids"]
+    feat_vals = data["feat_vals"]
+    d_sae = data["feat_ids"].max() + 1  # conservative upper bound
+    n = feat_ids.shape[0]
+    dense = np.zeros((n, int(d_sae)), dtype=np.float32)
+    for i in range(n):
+        dense[i, feat_ids[i]] = feat_vals[i]
+    clf_b = LogisticRegression(C=1.0, solver="liblinear", max_iter=1000)
+    clf_b.fit(dense[train_idx], y_train)
+    probs_b = clf_b.predict_proba(dense[val_idx])[:, 1]
+    results["B_l1_sparse"] = {
+        "val_auroc": float(roc_auc_score(y_val, probs_b)),
+        "val_acc": float(((probs_b >= 0.5) == y_val).mean()),
     }
-    return aligned, meta
+
+    return results
 
 
-@dataclass
-class RidgeModel:
-    mean: np.ndarray
-    std: np.ndarray
-    coef: np.ndarray
-
-    def predict(self, x: np.ndarray) -> np.ndarray:
-        xn = (x - self.mean) / self.std
-        xb = np.concatenate([xn, np.ones((xn.shape[0], 1), dtype=np.float64)], axis=1)
-        return np.asarray(xb @ self.coef, dtype=np.float32)
-
-
-def fit_ridge(x_train: np.ndarray, y_train: np.ndarray, l2: float) -> RidgeModel:
-    x = np.asarray(x_train, dtype=np.float64)
-    y = np.asarray(y_train, dtype=np.float64)
-    if x.shape[0] == 0:
-        raise ValueError("Ridge regression received an empty training set.")
-    mean = x.mean(axis=0)
-    std = x.std(axis=0)
-    std[std < 1e-8] = 1.0
-    xn = (x - mean) / std
-    xb = np.concatenate([xn, np.ones((xn.shape[0], 1), dtype=np.float64)], axis=1)
-
-    reg = np.eye(xb.shape[1], dtype=np.float64) * float(l2)
-    reg[-1, -1] = 0.0
-    lhs = xb.T @ xb + reg
-    rhs = xb.T @ y
-    try:
-        coef = np.linalg.solve(lhs, rhs)
-    except np.linalg.LinAlgError:
-        coef = np.linalg.pinv(lhs) @ rhs
-    return RidgeModel(mean=mean, std=std, coef=coef)
-
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Compact SAE-only attribution score predictor.")
-    parser.add_argument("--manifest", type=str, default="runs/simple_wordguesser_v1/manifest.json")
-    parser.add_argument("--split", type=str, default="score_pool")
-    parser.add_argument(
-        "--score-run-path",
-        type=str,
-        default="runs/simple_wordguesser_v1/attribution_mean_finetune_aligned_k500/train_scores",
-    )
-    parser.add_argument("--output-root", type=str, default="runs/simple_wordguesser_v1/sae_rank_predictor")
+    cfg = CONFIG
+    seed = cfg["seed"]
+    torch.manual_seed(seed)
+    np.random.seed(seed)
 
-    parser.add_argument("--target-type", choices=["score", "rank"], default="rank")
-    parser.add_argument("--top-k", type=int, default=100)
-    parser.add_argument("--max-rows", type=int, default=None)
-    parser.add_argument("--split-mode", choices=["grouped", "random"], default="grouped")
-    parser.add_argument("--group-key-fields", type=str, default="game,game_role,experiment,task_id")
-    parser.add_argument("--test-fraction", type=float, default=0.2)
-    parser.add_argument("--seed", type=int, default=42)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    out_root = Path(cfg["output_dir"])
+    out_root.mkdir(parents=True, exist_ok=True)
 
-    parser.add_argument("--sae-dir", type=str, required=True)
-    parser.add_argument("--sae-projection-dim", type=int, default=512)
-    parser.add_argument("--sae-ridge-l2", type=float, default=1.0)
-    args = parser.parse_args()
+    npz_path = Path(cfg["sae_features_dir"]) / f"{cfg['sae_id']}.npz"
+    if not npz_path.exists():
+        raise FileNotFoundError(f"SAE features not found: {npz_path}\nRun sae_analysis.py first.")
 
-    out = Path(args.output_root)
-    out.mkdir(parents=True, exist_ok=True)
+    # Use K=512 dataset to determine the train/val split (same indices for all K runs)
+    max_k = max(cfg["k_values"])
+    full_ds = SAEDataset(str(npz_path), k=max_k)
+    n_total = len(full_ds)
+    n_val = int(round(n_total * cfg["val_frac"]))
+    n_train = n_total - n_val
+    print(f"Dataset: {n_total} samples ({n_train} train, {n_val} val)")
 
-    manifest = load_manifest(args.manifest)
-    ds_path = split_path(manifest, args.split)
-    group_fields = [x.strip() for x in args.group_key_fields.split(",") if x.strip()]
-    rows = load_rows(ds_path, args.max_rows, group_fields)
-    if len(rows) < 2:
-        raise ValueError("Need at least 2 rows for train/test split.")
+    gen = torch.Generator().manual_seed(seed)
+    train_ds, val_ds = random_split(full_ds, [n_train, n_val], generator=gen)
+    train_idx = np.array(train_ds.indices)  # type: ignore[attr-defined]
+    val_idx = np.array(val_ds.indices)      # type: ignore[attr-defined]
 
-    scores = load_score_vector(Path(args.score_run_path))
-    y_raw = align_scores(rows, scores, Path(args.score_run_path))
-    y = y_raw if args.target_type == "score" else rank_percentile(y_raw)
+    all_results: dict[str, dict] = {}
 
-    group_keys = [row["group_key"] for row in rows]
-    if args.split_mode == "grouped":
-        train_idx, test_idx = grouped_split(group_keys, args.test_fraction, args.seed)
-    else:
-        train_idx, test_idx = random_split(len(rows), args.test_fraction, args.seed)
+    # --- Baselines ---
+    print("\n--- Baselines ---")
+    baseline_results = run_baselines(npz_path, train_idx, val_idx)
+    for name, res in baseline_results.items():
+        all_results[name] = res
+        print(f"  [{name}]  auroc={res['val_auroc']:.4f}  acc={res['val_acc']:.4f}")
 
-    x, sae_meta = build_sae_matrix(
-        sae_dir=Path(args.sae_dir),
-        rows=rows,
-        projection_dim=args.sae_projection_dim,
-        seed=args.seed,
-    )
-    model = fit_ridge(x[train_idx], y[train_idx], l2=args.sae_ridge_l2)
-    y_pred = model.predict(x)
+    # --- K ablation ---
+    print("\n--- K ablation (mean pooling, no global stats) ---")
+    for k in cfg["k_values"]:
+        print(f"\n[K={k}]")
+        out_dir = out_root / f"K{k}"
+        out_dir.mkdir(exist_ok=True)
 
-    train_metrics = regression_metrics(y[train_idx], y_pred[train_idx])
-    test_metrics = regression_metrics(y[test_idx], y_pred[test_idx])
-    full_metrics = regression_metrics(y, y_pred)
-    overlap = topk_overlap(y, y_pred, args.top_k)
+        ds_k = SAEDataset(str(npz_path), k=k)
+        train_ds_k = torch.utils.data.Subset(ds_k, train_idx.tolist())
+        val_ds_k = torch.utils.data.Subset(ds_k, val_idx.tolist())
+        train_loader = DataLoader(train_ds_k, batch_size=cfg["batch_size"], shuffle=True)
+        val_loader = DataLoader(val_ds_k, batch_size=cfg["batch_size"], shuffle=False)
 
-    row_scores_path = out / "row_scores.jsonl"
-    rank_order = np.argsort(-y_pred)
-    with row_scores_path.open("w") as f:
-        for rank, i in enumerate(rank_order, start=1):
-            row = rows[int(i)]
-            rec = {
-                "rank": int(rank),
-                "index": int(row["index"]),
-                "row_id": row["row_id"],
-                "target_score_raw": float(y_raw[int(i)]),
-                "target_value": float(y[int(i)]),
-                "pred_value": float(y_pred[int(i)]),
-                "abs_error": float(abs(y_pred[int(i)] - y[int(i)])),
-                "game": row.get("game"),
-                "game_role": row.get("game_role"),
-                "experiment": row.get("experiment"),
-                "task_id": row.get("task_id"),
-                "outcome": row.get("outcome"),
-                "pair_key": row.get("pair_key"),
-                "source_split": row.get("source_split"),
-            }
-            f.write(json.dumps(rec) + "\n")
+        model = SAEFingerprint(
+            d_sae=cfg["d_sae"],
+            d_embed=cfg["d_embed"],
+            d_hidden=cfg["d_hidden"],
+            dropout=cfg["dropout"],
+        )
+        result = train_neural(model, train_loader, val_loader, cfg, out_dir, device)
+        all_results[f"K{k}"] = {"val_auroc": result["val_auroc"], "val_acc": result["val_acc"], "K": k}
+        print(f"    best  auroc={result['val_auroc']:.4f}  acc={result['val_acc']:.4f}")
+        (out_dir / "history.json").write_text(json.dumps(result["history"], indent=2))
 
-    summary = {
-        "manifest": args.manifest,
-        "split": args.split,
-        "dataset_path": str(ds_path),
-        "score_run_path": args.score_run_path,
-        "mode": "sae",
-        "target_type": args.target_type,
-        "n_rows": int(len(rows)),
-        "train_size": int(len(train_idx)),
-        "test_size": int(len(test_idx)),
-        "train_metrics": train_metrics,
-        "test_metrics": test_metrics,
-        "full_metrics": full_metrics,
-        "topk_overlap_with_target": overlap,
-        "row_scores_path": str(row_scores_path),
-        "sae_meta": sae_meta,
-    }
-    summary_path = out / "summary.json"
-    summary_path.write_text(json.dumps(summary, indent=2))
+    # --- Summary ---
+    results_path = out_root / "ablation_results.json"
+    results_path.write_text(json.dumps({"config": cfg, "n_train": n_train, "n_val": n_val, "results": all_results}, indent=2))
 
-    print(f"saved outputs to: {out}")
-    print(
-        f"test pearson={test_metrics['pearson']} "
-        f"spearman={test_metrics['spearman']} "
-        f"rmse={test_metrics['rmse']:.6f}"
-    )
-    print(
-        f"top-k overlap with target ranking: {overlap['overlap_count']}/{overlap['k']} "
-        f"({overlap['overlap_fraction']:.4f})"
-    )
-    print(f"saved summary: {summary_path}")
+    print("\n=== Results ===")
+    print(f"{'Run':<18} {'AUROC':>7} {'Acc':>7}")
+    for name, res in all_results.items():
+        print(f"{name:<18} {res['val_auroc']:>7.4f} {res['val_acc']:>7.4f}")
+    print(f"\nSaved → {results_path}")
 
 
 if __name__ == "__main__":
