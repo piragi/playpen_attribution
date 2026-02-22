@@ -6,51 +6,50 @@ Last updated: 2026-02-22
 
 ## 1) Overall Goal
 
-Prove that **SAE feature analysis combined with data attribution can identify higher-quality SFT training data**, and that training on this selected data produces better instruction-following models than randomly sampled or heuristically filtered data.
+Prove that **residual stream probing + gradient-based data attribution can identify higher-quality SFT training data**, and that training on this selected data produces better instruction-following models than randomly sampled data.
 
 Concretely:
-1. **Phase 1**: LoRA SFT of Gemma-3-1b (base) on SmolTalk → establish a training run whose samples can be attributed. ✅
-2. **Phase 2**: Compute gradient-based data attribution (Bergson) → score each pool example by influence toward a high-quality query (smol-magpie-ultra). ← next
-3. **Phase 3**: Extract residual stream embeddings from the base model at layer 17 for the pool → fit a Ridge Regression probe to predict attribution scores.
-4. **Phase 4**: Apply the probe to a new 100k SmolTalk block → select top 10% → compare quality arm vs random arm on benchmarks.
+1. **Build data**: Tokenize smol-magpie-ultra → train/val/attr_pool splits (in-distribution).
+2. **Finetune scoring adapter**: LoRA SFT on train split → adapter used by Bergson attribution.
+3. **Attribution**: Bergson scores each attr_pool example by influence toward a high-quality attr_query (also from smol-magpie-ultra, good/excellent only, disjoint from pool).
+4. **Probe**: Fit Ridge Regression on layer-17 residual stream embeddings of attr_pool → predict attribution scores. Also run a quality-label ablation (binary good/excellent probe, no attribution needed).
+5. **Generate continuation datasets**: Apply probe to 200k new smol-magpie-ultra rows → select top-50k (quality arm) + random-50k (random arm).
+6. **Finetune 3 arms from base**: SFT (in-distribution train), quality arm, random arm.
+7. **Eval**: ARC, HellaSwag, WinoGrande, IFEval, GSM8K — compare arms.
 
-Core claim: **Residual stream probing makes data attribution scalable** — one forward pass through the base model + a linear probe replaces both the SAE pipeline and the custom neural classifier.
+Core claim: **Residual stream probing makes data attribution scalable** — one forward pass + linear probe replaces expensive per-example attribution at inference time.
 
-Baseline to beat: **random selection from the same pool**. If the SAE-selected quality arm outperforms the random arm, we have a result.
-
-Benchmarks: ARC-Challenge, ARC-Easy, HellaSwag, WinoGrande, MMLU (SmolTalk paper set; lm-eval harness, log-prob scoring, `--apply-chat-template` required for SFT models).
+Baseline to beat: **random selection from the same pool**. Quality arm must outperform random arm to validate the claim.
 
 ---
 
 ## 2) Key Design Decisions & Rationale
 
-### Why Gemma-3-1b base (not IT)?
+### Why SmolLM2-1.7B (not Gemma)?
 
-- **GemmaScope 2** SAEs are trained on base model activations (layer 17, width 16k). Using the IT model for SAE extraction creates a distribution mismatch.
-- Base model has **higher gradient variance** → cleaner attribution labels.
-- We borrow the IT tokenizer for its chat template (same vocabulary, same token IDs). This is the standard approach for SFT from a base model.
+- SAEs are no longer part of the pipeline — Gemma was chosen for GemmaScope SAE compatibility, which is now irrelevant.
+- SmolLM2-1.7B is HuggingFaceTB's own model, well-matched to SmolTalk (their dataset), making the SFT signal cleaner.
+- Native SDPA support (no flash_attn package needed), fits comfortably in 31 GB VRAM at seq_len=2048.
+
+### Why smol-magpie-ultra for everything (v2 design)?
+
+v1 used SmolTalk `all` for pool/train but smol-magpie-ultra for the query. This created a distribution mismatch — the attribution query was in a different domain than the training data being scored. v2 uses smol-magpie-ultra for query, attr_pool, AND train splits (disjoint rows), eliminating the mismatch.
 
 ### Why LoRA (not full fine-tuning)?
 
 - Gradient computation for attribution concentrates on LoRA adapter parameters, keeping the signal focused.
 - Fits in much less VRAM; faster iteration.
 
-### Why SmolTalk `all` config for train/pool?
-
-High quality variance (mix of Magpie-Ultra, Smol-Rewrite, Smol-Constraints, etc.) makes attribution signal meaningful. `smol-magpie-ultra` is a config of `HuggingFaceTB/smoltalk` that has quality labels preserved; the `all` config strips per-source metadata.
-
-### Attribution query: smol-magpie-ultra (good/excellent)
+### Attribution query: smol-magpie-ultra (good/excellent, disjoint from pool)
 
 The attr_query defines "quality" in gradient space — attribution scores measure how much a pool example helped produce behaviour like the query.
 
-- **Old query** (ARC-Challenge + WinoGrande): biased toward very short multiple-choice Q&A (~71 tokens/example). Created a -0.33 length correlation in attribution scores — shorter pool examples scored higher simply because they resembled the short query, not because they were better training data.
-- **New query**: 1,024 smol-magpie-ultra examples filtered to quality ∈ {good, excellent} (~820 tokens/example). Richer, more representative of what the model actually trained on.
-
-Load directly from the `smol-magpie-ultra` config (which preserves quality labels), not from `all` (which strips them).
+- 4,096 rows, quality ∈ {good, excellent}, category filter = None (all categories).
+- Built by `rebuild_attr_query.py`, which skips the rows already consumed by `build_sft_data.py` to ensure no overlap with attr_pool.
 
 ### No residualization
 
-Bergson uses `unit_normalize=True` + query-side TRAK preconditioning. The remaining length correlation in scores is content-based (longer examples genuinely more aligned with the smol-magpie-ultra query direction), not a magnitude artifact. Do **not** regress out length.
+Bergson uses `unit_normalize=True` + query-side TRAK preconditioning. Length correlation in scores is content-based, not magnitude artifact. Do **not** regress out length.
 
 ---
 
@@ -58,15 +57,14 @@ Bergson uses `unit_normalize=True` + query-side TRAK preconditioning. The remain
 
 | Script | Role |
 |---|---|
-| `build_sft_data.py` | Tokenize SmolTalk with IT chat template, mask prompts, produce train/val/attr_pool splits |
-| `rebuild_attr_query.py` | Rebuild attr_query from smol-magpie-ultra (quality-filtered) without touching other splits |
+| `build_sft_data.py` | Tokenize smol-magpie-ultra, mask prompts, produce train/val/attr_pool splits + manifest |
+| `rebuild_attr_query.py` | Build attr_query from smol-magpie-ultra (quality-filtered, disjoint from pool) |
 | `finetune.py` | LoRA SFT on pre-tokenized data; saves IT tokenizer alongside adapter |
-| `eval_harness.py` | lm-eval benchmark evaluation (ARC, HellaSwag, WinoGrande, MMLU) |
+| `eval_harness.py` | lm-eval benchmark evaluation (ARC, HellaSwag, WinoGrande, IFEval, GSM8K) |
 | `score.py` | Bergson gradient-based attribution; pool vs attr_query; supports PEFT adapters |
-| `probe.py` | Extract layer-17 residual stream from pool → fit Ridge probe to attribution scores |
-| `generate_continued_dataset.py` | Score new 100k SmolTalk block with probe → quality arm (top 10%) + random baseline |
-
-**Note:** `sae_analysis.py`, `train_bidir_classifier.py`, `build_continuation_data.py` were removed on this branch. They remain on `sft_pivot` if needed for reference.
+| `probe.py` | Extract layer-17 residual stream from pool → fit Ridge probe to attribution scores (or quality labels) |
+| `generate_continued_dataset.py` | Score 200k new smol-magpie-ultra rows with probe → quality arm (top 50k) + random baseline (50k) |
+| `vram.py` | VRAM profiler for SmolLM2-1.7B under training and inference configs |
 
 ---
 
@@ -75,85 +73,108 @@ Bergson uses `unit_normalize=True` + query-side TRAK preconditioning. The remain
 ### Base model + IT tokenizer pattern
 
 ```
-Training:    AutoModelForCausalLM.from_pretrained("google/gemma-3-1b-pt")   ← base weights
-Tokenizer:   AutoTokenizer.from_pretrained("google/gemma-3-1b-it")           ← chat template
+Training:    AutoModelForCausalLM.from_pretrained("HuggingFaceTB/SmolLM2-1.7B")          ← base weights
+Tokenizer:   AutoTokenizer.from_pretrained("HuggingFaceTB/SmolLM2-1.7B-Instruct")        ← chat template
 ```
 
-After training, the IT tokenizer is saved alongside the LoRA adapter. Downstream scripts
-(`eval_harness.py`, `score.py`) load tokenizer from the adapter directory.
+IT model naming convention for SmolLM2: base ends in `SmolLM2-1.7B` → instruct is `SmolLM2-1.7B-Instruct`
+(Gemma pattern was `-pt` → `-it`; SmolLM2 has no `-pt` suffix so append `-Instruct` instead.)
+
+After training, the IT tokenizer is saved alongside the LoRA adapter. Downstream scripts load tokenizer from the adapter directory.
+
+### resolve_model_path() pattern
+
+`from_pretrained` with a HuggingFace model ID can fail when `HF_HOME` is non-standard. All scripts use `resolve_model_path()` which checks the local cache at `/workspace/.hf_home/hub/models--{org}--{name}/snapshots/` and returns the local snapshot path directly:
+
+```python
+def resolve_model_path(model_id: str) -> str:
+    hf_home = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface"))
+    slug = "models--" + model_id.replace("/", "--")
+    snapshots_dir = hf_home / "hub" / slug / "snapshots"
+    if snapshots_dir.exists():
+        snapshots = sorted(snapshots_dir.iterdir())
+        if snapshots:
+            return str(snapshots[-1])
+    return model_id
+```
+
+### Attention implementation
+
+All scripts use `attn_implementation="sdpa"` (PyTorch built-in scaled dot product attention). Do **not** use `"eager"` (slow) or `"flash_attention_2"` (package not installed).
 
 ### Bergson rule
 
-Pass **pre-tokenized data** (`input_ids` + `labels` columns) directly. Bergson skips internal
-tokenization when `input_ids` is already present.
+Pass **pre-tokenized data** (`input_ids` + `labels` columns) directly. Bergson skips internal tokenization when `input_ids` is already present.
 
-- Pool (SmolTalk attr_pool): prompt tokens masked with `-100`, only assistant tokens supervised.
+- Pool (attr_pool): prompt tokens masked with `-100`, only assistant tokens supervised.
 - Query (attr_query): same masking — smol-magpie-ultra examples formatted with IT chat template.
-
-### Prompt masking
-
-`_mask_prompt()` in `build_sft_data.py` uses cumulative prefix tokenization to find exact token
-boundaries per assistant turn. Multi-turn conversations are handled correctly.
 
 ### score.py + PEFT
 
-Pass `--adapter-path <adapter_dir>` to `score.py`. It calls `ensure_adapter_config()` which
-injects a `config.json` (base model architecture) into the adapter directory so Bergson can
-load the full model via PEFT.
+Pass `--adapter-path <adapter_dir>` to `score.py`. It calls `ensure_adapter_config()` which injects a `config.json` into the adapter directory so Bergson can load the full model via PEFT.
 
-score.py defaults: `unit_normalize=True`, `query_preconditioner` (TRAK KFAC eigendecomposition
-on query side), `projection_dim=32`, `mixing_coefficient=0.99`. These are correct — do not change.
+score.py defaults: `unit_normalize=True`, `query_preconditioner` (TRAK KFAC eigendecomposition on query side), `projection_dim=32`, `mixing_coefficient=0.99`. These are correct — do not change.
 
-### eval_harness.py + IT tokenizer
+The manifest's `score_pool` key aliases `attr_pool` — score.py uses `--pool-split score_pool` by default.
 
-When `--adapter-path` is set, `build_model_args()` automatically appends
-`tokenizer=<adapter_path>` so lm-eval picks up the IT tokenizer (with chat template) from the
-adapter directory. Always pass `--apply-chat-template` for SFT model evaluation.
+### probe.py — two modes
 
-### lm-eval + Gemma3 fix
+- `use_quality_labels=False` (default): trains probe to predict Bergson attribution scores (regression). Saves `probe.pkl`.
+- `use_quality_labels=True`: trains probe on binary labels (good/excellent=1, else=0) using the `quality` field in attr_pool. Saves `probe_quality_labels.pkl`. Reports AUC + accuracy instead of R².
 
-lm-eval 0.4.11 passes `dtype=` to `Gemma3ForCausalLM.__init__` instead of `torch_dtype=`,
-causing a TypeError. Fix applied as a runtime monkey-patch at the top of `eval_harness.py`
-(wraps `AutoModelForCausalLM.from_pretrained` to translate `dtype=` → `torch_dtype=`).
-This survives `uv sync` / reinstalls — do NOT patch the installed package directly.
+Pool embeddings are cached to `pool_embeddings.npy` — if this file exists, probe.py skips model loading and reuses it. Delete the file to force re-extraction.
+
+### build_sft_data.py — attr_query handling
+
+When `query_smol_size=0` (v2 default), `build_sft_data.py` skips saving the attr_query split and omits it from the manifest. `rebuild_attr_query.py` populates it separately. This avoids a KeyError when the attr_query dataset is empty.
+
+### rebuild_attr_query.py — output path
+
+Derives the output path from `manifest["splits"]["attr_query"]["path"]` if it exists, otherwise defaults to `<manifest_dir>/data/attr_query`. This allows it to work even when `build_sft_data.py` did not create the attr_query entry.
+
+### eval_harness.py
+
+When `--adapter-path` is set, `build_model_args()` automatically appends `tokenizer=<adapter_path>` so lm-eval picks up the IT tokenizer from the adapter directory. Always pass `--apply-chat-template` for SFT model evaluation.
 
 ### SmolTalk streaming
 
-Always use `streaming=True` in `load_dataset` for SmolTalk. Without it, the full ~1M-row
-dataset downloads before processing begins.
+Always use `streaming=True` in `load_dataset` for SmolTalk. Without it, the full dataset downloads before processing begins.
 
 ### In-training eval disabled
 
-Gemma 3's 262k vocabulary causes OOM when computing eval loss (logits cast to float32 =
-~1 GB per example at seq_len=1024). Use `eval_harness.py` post-training instead.
+SmolLM2's 49k vocabulary causes OOM when computing eval loss at long seq_len. Use `eval_harness.py` post-training instead.
 
 ---
 
-## 5) Data Layout
+## 5) Data Layout (v2)
 
 ```
-runs/smoltalk_v1/
-  manifest.json
+runs/smoltalk_v2/
+  manifest.json                 ← paths, row counts, raw_rows_consumed
   data/
-    train/        100,000 rows — SFT training
-    val/            5,000 rows — SFT validation
-    attr_pool/     50,000 rows — attribution pool (scored by Bergson)
-    attr_query/     1,024 rows — smol-magpie-ultra quality∈{good,excellent}
-  adapter/        LoRA adapter + IT tokenizer (Gemma-3-1b)
+    train/        45,000 rows — SFT training (smol-magpie-ultra)
+    val/           2,000 rows — SFT validation
+    attr_pool/    15,000 rows — attribution pool (scored by Bergson)
+    attr_query/    4,096 rows — smol-magpie-ultra quality∈{good,excellent}, disjoint from pool
+  adapter/        LoRA scoring adapter + IT tokenizer (SmolLM2-1.7B)
   scores/
-    row_diagnostics.jsonl   ← per-pool-row Bergson scores (probe.py reads this)
+    row_diagnostics.jsonl       ← per-pool-row Bergson scores
     summary.json
     subsets/
   probe/
-    pool_embeddings.npy     ← (50000, 2048) layer-17 residual stream for pool
-    probe.pkl               ← fitted Ridge regression
-    probe_meta.json         ← R², Pearson r, layer, alpha
+    pool_embeddings.npy         ← (15000, 2048) layer-17 residual stream for attr_pool
+    probe.pkl                   ← fitted Ridge regression (attribution scores)
+    probe_quality_labels.pkl    ← fitted Ridge regression (binary quality labels)
+    probe_meta.json
   continuation/
-    continuation_manifest.json
-    quality/    — top-10k by probe score
-    random/     — 10k from non-quality remainder
-  adapter_quality/   LoRA adapter continued on quality arm
-  adapter_random/    LoRA adapter continued on random arm
+    quality/    — top-50k by probe score (from 200k new smol-magpie-ultra rows)
+    random/     — 50k from non-quality remainder
+  sft_adapter/     LoRA adapter trained on train split (in-distribution baseline)
+  quality_adapter/ LoRA adapter trained on quality arm
+  random_adapter/  LoRA adapter trained on random arm
+  eval_sft.json
+  eval_quality.json
+  eval_random.json
 ```
 
 ---
@@ -165,32 +186,37 @@ runs/smoltalk_v1/
 | Parameter | Value |
 |---|---|
 | `dataset_name` | `HuggingFaceTB/smoltalk` |
-| `dataset_config` | `all` |
-| `base_model` | `google/gemma-3-1b-pt` |
-| `tokenizer_model` | `google/gemma-3-1b-it` |
-| `max_length` | 1024 |
-| `train_size` | 100,000 |
-| `val_size` | 5,000 |
-| `attr_pool_size` | 50,000 |
+| `dataset_config` | `smol-magpie-ultra` |
+| `base_model` | `HuggingFaceTB/SmolLM2-1.7B` |
+| `tokenizer_model` | `HuggingFaceTB/SmolLM2-1.7B-Instruct` |
+| `max_length` | 2048 |
+| `train_size` | 45,000 |
+| `val_size` | 2,000 |
+| `attr_pool_size` | 15,000 |
+| `query_smol_size` | 0 (disabled; rebuild_attr_query.py handles it) |
 
 ### rebuild_attr_query.py
 
 | Parameter | Value |
 |---|---|
-| `query_smol_size` | 1,024 |
+| `query_smol_size` | 4,096 |
 | `quality_min` | `{good, excellent}` |
-| Source | `smol-magpie-ultra` config (first N passing filter, stream order) |
+| `category_filter` | None (all categories) |
+| Source | `smol-magpie-ultra`, skips rows consumed by build_sft_data.py |
 
 ### finetune.py
 
 | Parameter | Value |
 |---|---|
-| `base_model` | `google/gemma-3-1b-pt` |
+| `base_model` | `HuggingFaceTB/SmolLM2-1.7B` |
 | `num_train_epochs` | 2 |
 | `learning_rate` | 3e-4 |
 | `warmup_ratio` | 0.03 |
 | `weight_decay` | 0.01 |
 | `lr_scheduler_type` | cosine |
+| `per_device_train_batch_size` | 8 |
+| `gradient_accumulation_steps` | 4 (effective batch = 32) |
+| `gradient_checkpointing` | True |
 | `lora_r` | 16 |
 | `lora_alpha` | 32 |
 | `lora_dropout` | 0.05 |
@@ -200,89 +226,83 @@ runs/smoltalk_v1/
 
 | Parameter | Value |
 |---|---|
-| `extraction_layer` | 17 (try 14 if R² is low) |
-| `pooling` | Last response token position (last index where labels != -100) |
+| `extraction_layer` | 17 |
+| `pooling` | Last response token (last index where labels != -100) |
 | `ridge_alpha` | 1.0 |
 | `val_frac` | 0.20 |
+| `batch_size` | 64 |
 
 ### generate_continued_dataset.py
 
 | Parameter | Value |
 |---|---|
 | `extraction_layer` | 17 (must match probe.py) |
-| `pool_size` | 100,000 new SmolTalk rows to score |
-| `quality_size` | 10,000 (top 10% by probe score) |
-| `random_size` | 10,000 (drawn from non-quality remainder) |
+| `pool_size` | 200,000 new smol-magpie-ultra rows to score |
+| `quality_size` | 50,000 (top 25% by probe score) |
+| `random_size` | 50,000 (drawn from non-quality remainder) |
+| `batch_size` | 64 |
 
 ---
 
-## 7) Hardware Profile
+## 7) Hardware Profile — RTX 5090 (31.36 GB)
 
-### RTX 3080 (10 GB) — previous, reference only
+Measured with `vram.py`, SmolLM2-1.7B, sdpa, bfloat16, seq_len=2048.
 
-| Config | VRAM |
+| Config | Peak VRAM |
 |---|---|
-| 270M LoRA @ seq=1024, bs=1, grad ckpt | 5.24 GB |
-| 1B LoRA @ seq=1024, bs=1, grad ckpt | 8.42 GB |
-| 270M or 1B LoRA @ seq=2048+ | OOM |
+| Model load | 3.19 GB |
+| Inference bs=1 | 0.20 GB |
+| LoRA train bs=1, no grad_ckpt | 7.17 GB |
+| LoRA train bs=2, no grad_ckpt | 14.13 GB |
+| LoRA train bs=4, no grad_ckpt | OOM |
+| LoRA train bs=1, grad_ckpt ON | 1.15 GB |
+| LoRA train bs=2, grad_ckpt ON | 2.83 GB |
+| LoRA train bs=4, grad_ckpt ON | 5.66 GB |
+| LoRA train bs=8, grad_ckpt ON | 11.33 GB |
+| Inference bs=16 | 3.12 GB |
+| Inference bs=32 | 6.25 GB |
+| Inference bs=64 | 12.50 GB |
+| Inference bs=128 | OOM |
 
-### RTX 5090 (32 GB) — current
-
-Profiling TBD (`vram.py`). Expected to unlock seq_len ≥ 2048 and larger batch sizes.
-Update this section after profiling run.
+**Recommended settings**: training with grad_ckpt + bs=8; probe/generate with bs=64.
 
 ---
 
-## 8) CPT/FineWeb History (v1/v2 — abandoned)
+## 8) Open Questions
+
+1. **Probe R²**: If R² < 0.05 on held-out pool examples, the probe is not learning the attribution direction. Try layer 14 (mid-network) vs layer 17.
+
+2. **Quality labels ablation**: Does the binary quality label probe (no attribution needed) achieve comparable selection quality to the attribution probe? If yes, attribution is redundant and quality labels alone suffice.
+
+3. **Benchmark sensitivity**: lm-eval on a 1.7B model has real variance. Compare deltas vs SFT arm rather than absolute numbers. If quality and random arms look identical, check probe R² and selection threshold.
+
+4. **Selection rate**: quality arm = top-50k of 200k pool (~25%). If signal is weak, try tightening to top-10% (20k examples).
+
+---
+
+## 9) CPT/FineWeb History (v1/v2 — abandoned)
 
 The original plan was continued pretraining (CPT) on FineWeb. Abandoned because:
 
 - **v1** (lr=1e-4, wd=0.1, 100M tokens): Regressed on all benchmarks (worst: ARC-Easy −0.073).
 - **v2** (lr=3e-5, wd=0.01, 200M tokens): Plan was written but never run — pivot to SFT instead.
 
-SAE classifier results from v1 pilot (despite regressed labels):
-
-| Model | Val AUROC | Val Acc |
-|---|---|---|
-| Logistic regression (10 global stats) | 0.623 | 0.593 |
-| L1 logistic on sparse 16k vector | 0.639 | 0.607 |
-| **Mean pooling, K=256** | **0.748** | **0.682** |
-| Attention pooling, K=256 | 0.742 | 0.678 |
-
-Winner: mean pooling, K=256, no global stats. Architecture carries forward.
-
 ---
 
-## 9) Open Questions
+## 10) Theoretical Foundation & Related Work
 
-1. **Probe R²**: If R² < 0.05 on held-out pool examples, the probe is not learning the attribution direction. Try layer 14 (mid-network) vs layer 17 (later). Possible cause: score.py was run with the old ARC/WinoGrande query — re-run with smol-magpie-ultra attr_query first.
-
-2. **Benchmark sensitivity**: lm-eval on a 1B model over short finetunes has real variance. Compare deltas vs the v1 baseline rather than absolute numbers. If quality and random arms look identical, check probe R² and selection threshold.
-
-3. **Selection rate**: quality arm = top-10% of 100k pool. If signal is weak, try tightening to top-5% (5k examples).
-
-4. **Layer ablation**: Start with layer 17. If R² is low, try 14. Further ablation (9, 12, 20) is possible but probably not worth it before seeing R² results.
-
-5. **seq_len**: After 5090 profiling, consider increasing max_length beyond 1024.
-
-
-## 11) Theoretical Foundation & Related Work
-
-While linear probes are traditionally used in Mechanistic Interpretability as purely diagnostic tools (to prove a feature exists in superposition), using them as active, production-grade filters draws on two highly mainstream paradigms: **Representation Engineering (RepE)** and **Reward Modeling**. 
+While linear probes are traditionally used in Mechanistic Interpretability as purely diagnostic tools, using them as active filters draws on two mainstream paradigms: **Representation Engineering (RepE)** and **Reward Modeling**.
 
 This pipeline essentially trains a Data Quality Reward Model using gradient attribution (Bergson) as the ground-truth signal instead of human annotators.
 
-### 1. Representation Engineering: A Top-Down Approach to AI Transparency
-**Source:** Zou, A., Phan, L., et al. (Center for AI Safety, 2023). *arXiv:2310.01405*
-* **The Concept:** Instead of looking at individual neurons (bottom-up), RepE proves that high-level semantic concepts (like honesty, harmlessness, and utility) are linearly represented across the macro-activation space of an LLM's residual stream. 
-* **How it connects to our pipeline:** Zou et al. successfully used linear probes (and PCA) on the middle-to-late hidden states of models like LLaMA-2 to detect and steer complex behaviors. By training a Ridge Regression probe on Layer 14 to predict Bergson scores, we are directly applying RepE to find the linear vector for "Training Data Quality."
+### Representation Engineering (Zou et al., 2023 — arXiv:2310.01405)
 
-### 2. Training Language Models to Follow Instructions with Human Feedback (InstructGPT)
-**Source:** Ouyang, L., Wu, J., et al. (OpenAI, 2022). *NeurIPS 2022*
-* **The Concept:** The foundational paper for RLHF. To scale human preferences, OpenAI trained a "Reward Model" to predict a scalar quality score for any given text generation. 
-* **How it connects to our pipeline:** Standard Reward Models (like those in InstructGPT and Llama 2) are structurally identical to our proposed `probe.py`. They consist of a base Transformer where the final vocabulary unembedding matrix is replaced by a single linear projection head. We are using the exact same architecture, but our "human preference" is replaced by the rigorous, mathematical gradient attribution score from Phase 2.
+Proves that high-level semantic concepts are linearly represented across the residual stream. By training a Ridge Regression probe on layer-17 hidden states to predict Bergson scores, we apply RepE to find the linear vector for "Training Data Quality."
 
-### 3. The Internal State of an LLM Knows When It's Lying
-**Source:** Azaria, A., & Mitchell, T. (2023). *Findings of the Association for Computational Linguistics: EMNLP 2023*
-* **The Concept:** The authors trained a simple classifier (SAPLMA) on the hidden layer activations of an LLM to predict whether the statement the LLM was processing was true or false. 
-* **How it connects to our pipeline:** This paper proves that LLMs internally compute rigorous semantic evaluations (like factual accuracy) in their hidden states, and that extracting these states via a probe is vastly more reliable than relying on the model's output probabilities (which are skewed by token length and frequency). This validates our choice to probe the residual stream directly rather than using the model as an "LLM-as-a-judge" via prompting.
+### InstructGPT / RLHF (Ouyang et al., NeurIPS 2022)
+
+Standard Reward Models are structurally identical to our probe — a base Transformer with the unembedding matrix replaced by a linear projection head. We use the same architecture, but Bergson attribution replaces human preference labels.
+
+### SAPLMA (Azaria & Mitchell, EMNLP 2023)
+
+Proves that LLMs internally compute semantic evaluations in hidden states, and probing residual stream is more reliable than output probabilities. Validates probing over LLM-as-a-judge approaches.

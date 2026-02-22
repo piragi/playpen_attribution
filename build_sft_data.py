@@ -32,19 +32,19 @@ from transformers import AutoTokenizer
 
 CONFIG = {
     "dataset_name": "HuggingFaceTB/smoltalk",
-    "dataset_config": "all",  # full SmolTalk mix; use "smol-magpie-ultra" for smaller/faster
-    "base_model": "google/gemma-3-1b-pt",      # model weights for training
-    "tokenizer_model": "google/gemma-3-1b-it",  # tokenizer for chat template (same vocab)
-    "max_length": 1024,
+    "dataset_config": "smol-magpie-ultra",  # in-distribution; quality labels preserved
+    "base_model": "HuggingFaceTB/SmolLM2-1.7B",      # model weights for training
+    "tokenizer_model": "HuggingFaceTB/SmolLM2-1.7B-Instruct",  # tokenizer for chat template (same vocab)
+    "max_length": 2048,
     # Split sizes (rows, not tokens)
-    "train_size": 100_000,
-    "val_size": 5_000,
-    "attr_pool_size": 50_000,
-    # Attribution query composition
-    "query_smol_size": 1024,  # smol-magpie-ultra examples (fresh, past raw_rows_consumed)
-    "query_gsm8k_size": 0,    # GSM8K train reasoning traces (set >0 to enable)
-    "query_arc_size": 0,      # ARC-Challenge for factual grounding (set >0 to enable)
-    "output_dir": "runs/smoltalk_v1",
+    "train_size": 1_000,
+    "val_size": 2_000,
+    "attr_pool_size": 15_000,
+    # Attribution query composition (handled by rebuild_attr_query.py for v2)
+    "query_smol_size": 0,     # disabled: rebuild_attr_query.py builds attr_query separately
+    "query_gsm8k_size": 0,
+    "query_arc_size": 0,
+    "output_dir": "runs/smoltalk_v2",
     "seed": 42,
 }
 
@@ -132,6 +132,9 @@ def build_smoltalk_splits(tokenizer: Any, cfg: dict) -> tuple[Dataset, Dataset, 
         if tok_out is None:
             continue
         tok_out["magpie_score"] = _get_magpie_score(row)
+        # Store quality/category when available (smol-magpie-ultra preserves these labels).
+        tok_out["quality"] = row.get("quality", "")
+        tok_out["category"] = row.get("category", "")
         rows.append(tok_out)
         if len(rows) % 5000 == 0:
             print(f"  processed {len(rows):,} valid rows...", flush=True)
@@ -319,6 +322,9 @@ def main() -> None:
         ("attr_pool", attr_pool_ds),
         ("attr_query", query_ds),
     ]:
+        if len(ds) == 0:
+            print(f"  {name}: 0 rows — skipped (rebuild_attr_query.py will build this)")
+            continue
         path = out / "data" / name
         if path.exists():
             import shutil
@@ -335,6 +341,7 @@ def main() -> None:
     # Write manifest for score.py
     manifest = {
         "base_model": cfg["base_model"],
+        "tokenizer_model": cfg["tokenizer_model"],
         "max_length": cfg["max_length"],
         "dataset": cfg["dataset_name"],
         "dataset_config": cfg["dataset_config"],
@@ -342,7 +349,8 @@ def main() -> None:
         "splits": {
             # score.py uses score_pool + attr_query
             "score_pool": splits_info["attr_pool"],
-            "attr_query": splits_info["attr_query"],
+            # attr_query populated by rebuild_attr_query.py (may not exist yet)
+            **( {"attr_query": splits_info["attr_query"]} if "attr_query" in splits_info else {} ),
             # full train/val for reference
             "train": splits_info["train"],
             "val": splits_info["val"],

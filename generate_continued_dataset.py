@@ -16,8 +16,12 @@ Usage (run AFTER probe.py):
 from __future__ import annotations
 
 import json
+import os
 import pickle
 from pathlib import Path
+
+# Ensure transformers/datasets find the local model cache.
+os.environ.setdefault("HF_HOME", "/workspace/.hf_home")
 from typing import Any
 
 import numpy as np
@@ -28,16 +32,32 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from build_sft_data import _get_magpie_score, _mask_prompt
 
 CONFIG = {
-    "manifest_path": "runs/smoltalk_v1/manifest.json",
-    "probe_dir": "runs/smoltalk_v1/probe",
-    "output_dir": "runs/smoltalk_v1/continuation",
+    "manifest_path": "runs/smoltalk_v2/manifest.json",
+    "probe_dir": "runs/smoltalk_v2/probe",
+    "probe_filename": "probe.pkl",   # swap to "probe_quality_labels.pkl" for ablation
+    "output_dir": "runs/smoltalk_v2/continuation",
     "extraction_layer": 17,    # must match probe.py
     "pool_size": 200_000,      # new SmolTalk rows to score
     "quality_size": 50_000,    # top-N by probe score → quality arm
     "random_size": 50_000,     # random-N from the non-quality remainder → baseline
+    "batch_size": 64,          # forward-pass batch size for scoring
     "seed": 42,
     "device": "auto",
 }
+
+
+def resolve_model_path(model_id: str) -> str:
+    """Return local snapshot path if cached, otherwise return model_id for hub download."""
+    hf_home = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface"))
+    cache_dir = hf_home / "hub"
+    # HF cache layout: models--{org}--{name}/snapshots/<hash>/
+    slug = "models--" + model_id.replace("/", "--")
+    snapshots_dir = cache_dir / slug / "snapshots"
+    if snapshots_dir.exists():
+        snapshots = sorted(snapshots_dir.iterdir())
+        if snapshots:
+            return str(snapshots[-1])
+    return model_id
 
 
 def resolve_device(device_arg: str) -> tuple[str, torch.dtype]:
@@ -50,28 +70,44 @@ def resolve_device(device_arg: str) -> tuple[str, torch.dtype]:
     return device_arg, torch.float32
 
 
-def get_embedding(
-    input_ids: list[int],
-    labels: list[int],
+def score_batch(
+    batch_rows: list[dict],
+    probe: Any,
     model: Any,
     captured: dict,
     device: str,
-) -> np.ndarray:
-    """Single forward pass → residual stream at the last response token position.
+) -> list[float]:
+    """Batched forward pass → probe scores for a list of tokenized rows.
 
-    For a decoder-only model the last response token has attended to every preceding
-    token via causal attention, making it the most information-dense single position.
-    This matches the pooling strategy in probe.py and standard reward model heads.
+    Pads to the max length within the batch, runs one forward pass, then gathers
+    the last response token (last index where labels != -100) for each example.
+    Identical pooling strategy to probe.py and standard reward model heads.
     """
-    ids_t = torch.tensor([input_ids], dtype=torch.long, device=device)
+    max_len = max(len(r["input_ids"]) for r in batch_rows)
+    ids_padded, lbl_padded = [], []
+    for r in batch_rows:
+        pad = max_len - len(r["input_ids"])
+        ids_padded.append(r["input_ids"] + [0] * pad)
+        lbl_padded.append(r["labels"] + [-100] * pad)
+
+    ids_t = torch.tensor(ids_padded, dtype=torch.long, device=device)
+    lbl_t = torch.tensor(lbl_padded, dtype=torch.long)  # CPU for index finding
+
     with torch.inference_mode():
         model(input_ids=ids_t)
-    hidden = captured["acts"].squeeze(0).float().cpu()   # (seq_len, d_model)
+    hidden = captured["acts"]  # (batch, seq_len, d_model)
 
-    lbl_t = torch.tensor(labels, dtype=torch.long)
-    resp_positions = (lbl_t != -100).nonzero(as_tuple=True)[0]
-    last_idx = int(resp_positions[-1]) if len(resp_positions) > 0 else len(labels) - 1
-    return hidden[last_idx].numpy()
+    # Last response token per example
+    last_resp_idx = torch.zeros(len(batch_rows), dtype=torch.long)
+    for i in range(len(batch_rows)):
+        resp_positions = (lbl_t[i] != -100).nonzero(as_tuple=True)[0]
+        last_resp_idx[i] = resp_positions[-1] if len(resp_positions) > 0 else lbl_t.shape[1] - 1
+
+    idx = last_resp_idx.to(hidden.device).unsqueeze(-1).unsqueeze(-1)
+    idx = idx.expand(-1, 1, hidden.shape[-1])
+    pooled = hidden.gather(dim=1, index=idx).squeeze(1).float().cpu().numpy()  # (batch, d_model)
+
+    return [float(probe.predict(pooled[i].reshape(1, -1))[0]) for i in range(len(batch_rows))]
 
 
 def estimate_skip_rows(manifest: dict) -> int:
@@ -87,8 +123,6 @@ def estimate_skip_rows(manifest: dict) -> int:
 
 def main() -> None:
     cfg = CONFIG
-    rng = np.random.default_rng(cfg["seed"])
-
     device, dtype = resolve_device(cfg["device"])
     print(f"Device: {device}, dtype: {dtype}")
 
@@ -106,7 +140,7 @@ def main() -> None:
         print(f"Skipping first {skip_rows:,} raw SmolTalk rows (used by build_sft_data.py)")
 
     # --- Load probe ---
-    probe_path = Path(cfg["probe_dir"]) / "probe.pkl"
+    probe_path = Path(cfg["probe_dir"]) / cfg.get("probe_filename", "probe.pkl")
     if not probe_path.exists():
         raise FileNotFoundError(f"Probe not found: {probe_path}\nRun probe.py first.")
     with probe_path.open("rb") as f:
@@ -114,20 +148,21 @@ def main() -> None:
     print(f"Loaded probe from {probe_path}")
 
     # --- IT tokenizer ---
-    it_model = base_model.replace("-pt", "") + "-it"
+    it_model = (base_model[:-3] + "-it") if base_model.endswith("-pt") else (base_model + "-Instruct")
     tokenizer = AutoTokenizer.from_pretrained(it_model)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
     # --- Base model + hook ---
-    print(f"\nLoading {base_model} ...")
+    model_path = resolve_model_path(base_model)
+    print(f"\nLoading {base_model} (path: {model_path}) ...")
     captured: dict[str, torch.Tensor] = {}
 
     def hook_fn(_module: Any, _input: Any, output: Any) -> None:
         captured["acts"] = output[0] if isinstance(output, tuple) else output
 
     model = AutoModelForCausalLM.from_pretrained(
-        base_model, torch_dtype=dtype, device_map=device, attn_implementation="eager"
+        model_path, torch_dtype=dtype, device_map=device, attn_implementation="sdpa"
     )
     model.eval()
     model.config.use_cache = False
@@ -141,6 +176,14 @@ def main() -> None:
     pool_rows: list[dict] = []
     pool_scores: list[float] = []
     raw_seen = 0
+    batch_size = cfg["batch_size"]
+    buffer: list[dict] = []
+
+    def flush_buffer() -> None:
+        scores = score_batch(buffer, probe, model, captured, device)
+        pool_rows.extend(buffer)
+        pool_scores.extend(scores)
+        buffer.clear()
 
     for row in raw:
         raw_seen += 1
@@ -157,16 +200,16 @@ def main() -> None:
             continue
         tok_out["magpie_score"] = _get_magpie_score(row)
 
-        emb = get_embedding(tok_out["input_ids"], tok_out["labels"], model, captured, device)
-        score = float(probe.predict(emb.reshape(1, -1))[0])
-
-        pool_rows.append(tok_out)
-        pool_scores.append(score)
-
-        if len(pool_rows) % 1_000 == 0:
-            print(f"  scored {len(pool_rows):,}/{cfg['pool_size']:,}", flush=True)
+        buffer.append(tok_out)
+        if len(buffer) >= batch_size:
+            flush_buffer()
+            if len(pool_rows) % 1_000 == 0:
+                print(f"  scored {len(pool_rows):,}/{cfg['pool_size']:,}", flush=True)
         if len(pool_rows) >= cfg["pool_size"]:
             break
+
+    if buffer:  # flush remaining partial batch
+        flush_buffer()
 
     n_pool = len(pool_rows)
     scores_arr = np.array(pool_scores, dtype=np.float32)
@@ -189,11 +232,30 @@ def main() -> None:
     print(f"\nQuality arm: top-{quality_size} (score >= {threshold:.4f})")
     print(f"  score range: [{scores_arr[quality_idx].min():.4f}, {scores_arr[quality_idx].max():.4f}]")
 
-    # Random arm: drawn from the non-quality remainder for a controlled comparison
-    non_quality_idx = np.setdiff1d(np.arange(n_pool), top_idx)
-    rand_chosen = sorted(rng.choice(non_quality_idx, size=random_size, replace=False).tolist())
-    random_rows = [pool_rows[i] for i in rand_chosen]
-    print(f"Random arm: {random_size} sampled from {len(non_quality_idx):,} non-quality examples")
+    # Random arm: the next random_size valid examples from the stream after the scored pool.
+    # No scoring, no selection — pure next-in-stream baseline.
+    print(f"\nCollecting random arm: next {random_size} valid examples from stream ...")
+    random_rows: list[dict] = []
+    for row in raw:
+        messages = row.get("messages") or row.get("conversations") or []
+        if not messages:
+            continue
+        tok_out = _mask_prompt(messages, tokenizer, max_length)
+        if tok_out is None:
+            continue
+        tok_out["magpie_score"] = _get_magpie_score(row)
+        random_rows.append(tok_out)
+        if len(random_rows) % 1_000 == 0:
+            print(f"  collected {len(random_rows):,}/{random_size:,}", flush=True)
+        if len(random_rows) >= random_size:
+            break
+
+    if len(random_rows) < random_size:
+        raise RuntimeError(
+            f"Only {len(random_rows)} examples for random arm; need {random_size}. "
+            "SmolTalk may be exhausted — reduce random_size."
+        )
+    print(f"Random arm: {len(random_rows):,} next-in-stream examples (no selection)")
 
     # --- Save ---
     out_dir = Path(cfg["output_dir"])
@@ -225,6 +287,7 @@ def main() -> None:
             "pool_max": float(scores_arr.max()),
             "quality_mean": float(scores_arr[quality_idx].mean()),
             "quality_threshold": threshold,
+            "random_arm": "next-in-stream (unscored)",
         },
         "arms": {
             "quality": quality_info,

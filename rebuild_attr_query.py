@@ -24,9 +24,11 @@ from transformers import AutoTokenizer
 from build_sft_data import _get_magpie_score, _mask_prompt
 
 CONFIG = {
-    "manifest_path": "runs/smoltalk_v1/manifest.json",
-    "query_smol_size": 1024,
+    "manifest_path": "runs/smoltalk_v2/manifest.json",
+    "query_smol_size": 4096,
     "quality_min": {"good", "excellent"},
+    # Set to None to accept all categories (recommended for v2 in-distribution setup).
+    "category_filter": None,
     "seed": 42,
 }
 
@@ -40,7 +42,7 @@ def main() -> None:
     tokenizer_model = manifest.get("tokenizer_model", "google/gemma-3-1b-it")
     base_model = manifest.get("base_model", "google/gemma-3-1b-pt")
     if not tokenizer_model or tokenizer_model == base_model:
-        tokenizer_model = base_model.replace("-pt", "") + "-it"
+        tokenizer_model = (base_model[:-3] + "-it") if base_model.endswith("-pt") else (base_model + "-Instruct")
 
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_model)
     if tokenizer.pad_token is None:
@@ -50,18 +52,36 @@ def main() -> None:
     quality_ok = cfg["quality_min"]
     n_target = cfg["query_smol_size"]
 
+    # Skip rows already consumed by build_sft_data.py to prevent attr_query/attr_pool overlap.
+    # Only relevant when dataset_config == "smol-magpie-ultra" (both stream the same source).
+    skip_rows = 0
+    if manifest.get("dataset_config") == "smol-magpie-ultra":
+        skip_rows = manifest.get("raw_rows_consumed", 0)
+        if skip_rows:
+            print(f"  skipping first {skip_rows:,} raw rows (consumed by build_sft_data.py)")
+
+    category_filter = cfg.get("category_filter")  # None → accept all
     print(f"Loading {dataset_name}/smol-magpie-ultra ...")
-    print(f"  quality filter: {quality_ok}")
+    print(f"  quality filter:   {quality_ok}")
+    print(f"  category filter:  {sorted(category_filter) if category_filter else 'all'}")
     smol_raw = load_dataset(dataset_name, "smol-magpie-ultra", split="train", streaming=True)
 
     quality_dist: dict[str, int] = {}
+    category_dist: dict[str, int] = {}
     candidate_rows: list[dict] = []
+    raw_seen = 0
 
     for row in smol_raw:
+        raw_seen += 1
+        if raw_seen <= skip_rows:
+            continue
         quality = row.get("quality", "")
+        category = row.get("category", "")
         quality_dist[quality] = quality_dist.get(quality, 0) + 1
 
         if quality not in quality_ok:
+            continue
+        if category_filter and category not in category_filter:
             continue
 
         messages = row.get("messages") or row.get("conversations") or []
@@ -72,22 +92,28 @@ def main() -> None:
             continue
 
         tok_out["magpie_score"] = _get_magpie_score(row)
+        tok_out["category"] = category
+        category_dist[category] = category_dist.get(category, 0) + 1
         candidate_rows.append(tok_out)
 
         if len(candidate_rows) >= n_target:
             break
 
-    print(f"\nQuality distribution seen so far:")
+    print(f"\nQuality distribution seen:")
     for q, c in sorted(quality_dist.items()):
         mark = "✓" if q in quality_ok else " "
         print(f"  {mark} {q or '(empty)'}: {c:,}")
+    print(f"\nCategory breakdown of collected rows:")
+    for cat, c in sorted(category_dist.items(), key=lambda x: -x[1]):
+        print(f"    {cat:<22} {c:>5,}  ({c/len(candidate_rows)*100:.1f}%)")
     print(f"Collected {len(candidate_rows):,} rows")
 
     if len(candidate_rows) == 0:
         raise RuntimeError(f"No rows passed quality filter {quality_ok}")
 
     query_ds = Dataset.from_list(candidate_rows)
-    out_path = Path(manifest["splits"]["attr_query"]["path"])
+    default_path = str(Path(cfg["manifest_path"]).parent / "data" / "attr_query")
+    out_path = Path(manifest.get("splits", {}).get("attr_query", {}).get("path", default_path))
     if out_path.exists():
         shutil.rmtree(out_path)
     query_ds.save_to_disk(str(out_path))
@@ -97,13 +123,17 @@ def main() -> None:
         "rows": len(query_ds),
         "total_tokens": int(sum(query_ds["length"])),
     }
-    manifest["attr_query_source"] = f"smol-magpie-ultra quality>={sorted(quality_ok)}"
+    manifest["attr_query_source"] = (
+        f"smol-magpie-ultra quality>={sorted(quality_ok)}"
+        + (f" category={sorted(category_filter)}" if category_filter else "")
+    )
     Path(cfg["manifest_path"]).write_text(json.dumps(manifest, indent=2))
 
     print(f"\nSaved {len(query_ds)} attr_query rows → {out_path}")
+    run_dir = str(Path(cfg["manifest_path"]).parent)
     print("\nNext: rerun score.py to recompute attribution with the new query:")
-    print("  uv run score.py --adapter-path runs/smoltalk_v1/adapter "
-          "--output-dir runs/smoltalk_v1/scores")
+    print(f"  uv run score.py --adapter-path {run_dir}/adapter "
+          f"--output-dir {run_dir}/scores")
 
 
 if __name__ == "__main__":

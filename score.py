@@ -2,8 +2,22 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 from pathlib import Path
+
+os.environ.setdefault("HF_HOME", "/workspace/.hf_home")
+
+
+def resolve_model_path(model_id: str) -> str:
+    hf_home = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface"))
+    slug = "models--" + model_id.replace("/", "--")
+    snapshots_dir = hf_home / "hub" / slug / "snapshots"
+    if snapshots_dir.exists():
+        snapshots = sorted(snapshots_dir.iterdir())
+        if snapshots:
+            return str(snapshots[-1])
+    return model_id
 
 import numpy as np
 from bergson.build import build
@@ -80,10 +94,15 @@ def make_index_config(
     args: argparse.Namespace,
     skip_preconditioners: bool,
 ) -> IndexConfig:
+    model_path = args.adapter_path or resolve_model_path(args.base_model)
+    # Use IT model for tokenizer (same vocab, has chat template); fall back to base.
+    it_model = args.base_model if args.base_model.endswith("-Instruct") \
+        else args.base_model + "-Instruct"
+    tokenizer_path = args.adapter_path or resolve_model_path(it_model)
     return IndexConfig(
         run_path=str(run_path),
-        model=args.adapter_path,
-        tokenizer=args.adapter_path,
+        model=model_path,
+        tokenizer=tokenizer_path,
         projection_dim=args.projection_dim,
         token_batch_size=args.token_batch_size,
         skip_preconditioners=skip_preconditioners,
@@ -372,7 +391,7 @@ def main() -> None:
                         help="PEFT adapter path. If omitted, --base-model is used directly.")
     parser.add_argument("--base-model", type=str, default="google/gemma-3-1b-pt")
     parser.add_argument("--output-dir", type=str, default="runs/smoltalk_v1/attribution")
-    parser.add_argument("--token-batch-size", type=int, default=1024)
+    parser.add_argument("--token-batch-size", type=int, default=2048)
     parser.add_argument("--projection-dim", type=int, default=32)
     parser.add_argument("--preconditioning-mode", choices=["none", "query", "mixed"], default="query")
     parser.add_argument(
@@ -431,8 +450,13 @@ def main() -> None:
 
         # Resolve the effective model path: adapter if given, else the base model itself.
         # Overwrite args.adapter_path so all downstream calls (make_index_config etc.) see it.
-        args.adapter_path = args.adapter_path if args.adapter_path else args.base_model
-        ensure_adapter_config(Path(args.adapter_path), args.base_model)
+        if args.adapter_path:
+            ensure_adapter_config(Path(args.adapter_path), args.base_model)
+        else:
+            # No adapter: point directly at the cached base model snapshot.
+            # Do NOT call ensure_adapter_config — it would create a local stub directory
+            # with only config.json and no tokenizer files, causing tokenizer load failures.
+            args.adapter_path = resolve_model_path(args.base_model)
 
         pool_path = pool_source
         query_path = query_source

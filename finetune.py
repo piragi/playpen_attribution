@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 
 import torch
@@ -25,8 +26,20 @@ from datasets import load_from_disk
 from peft import LoraConfig, PeftConfig, PeftModel, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer, DataCollatorForSeq2Seq, Trainer, TrainingArguments
 
+def resolve_model_path(model_id: str) -> str:
+    """Return local snapshot path if cached, otherwise return model_id for hub download."""
+    hf_home = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface"))
+    slug = "models--" + model_id.replace("/", "--")
+    snapshots_dir = hf_home / "hub" / slug / "snapshots"
+    if snapshots_dir.exists():
+        snapshots = sorted(snapshots_dir.iterdir())
+        if snapshots:
+            return str(snapshots[-1])
+    return model_id
+
+
 CONFIG = {
-    "base_model": "google/gemma-3-1b-pt",  # base model weights: larger gradient variance, matches GemmaScope SAE distribution
+    "base_model": "HuggingFaceTB/SmolLM2-1.7B",
     "train_data": "runs/smoltalk_v1/data/train",
     "val_data": "runs/smoltalk_v1/data/val",
     "output_dir": "runs/smoltalk_v1/adapter",
@@ -36,8 +49,8 @@ CONFIG = {
     "warmup_ratio": 0.03,
     "weight_decay": 0.01,
     "lr_scheduler_type": "cosine",
-    "per_device_train_batch_size": 4,
-    "gradient_accumulation_steps": 8,
+    "per_device_train_batch_size": 8,
+    "gradient_accumulation_steps": 4,
     "logging_steps": 20,
     "save_steps": 500,
     "save_total_limit": 2,
@@ -76,9 +89,9 @@ def run_train(args: argparse.Namespace) -> None:
     dtype = torch.bfloat16 if use_bf16 else torch.float32
 
     base = AutoModelForCausalLM.from_pretrained(
-        args.base_model,
+        resolve_model_path(args.base_model),
         torch_dtype=dtype,
-        attn_implementation="eager",
+        attn_implementation="sdpa",
     )
     base.config.use_cache = False
 
@@ -106,7 +119,7 @@ def run_train(args: argparse.Namespace) -> None:
     # Otherwise derive IT model name from base: strip -pt suffix, append -it.
     # e.g. google/gemma-3-1b-pt → google/gemma-3-1b-it
     #      google/gemma-3-270m   → google/gemma-3-270m-it
-    it_model = args.base_model.replace("-pt", "") + "-it"
+    it_model = (args.base_model[:-3] + "-it") if args.base_model.endswith("-pt") else (args.base_model + "-Instruct")
     it_tokenizer_source = tokenizer_source if args.resume_adapter else it_model
     tokenizer = AutoTokenizer.from_pretrained(it_tokenizer_source)
     if tokenizer.pad_token is None:
@@ -185,7 +198,7 @@ def run_merge(args: argparse.Namespace) -> None:
     dtype = torch.bfloat16 if use_bf16 else torch.float32
 
     base = AutoModelForCausalLM.from_pretrained(
-        base_model, torch_dtype=dtype, attn_implementation="eager"
+        resolve_model_path(base_model), torch_dtype=dtype, attn_implementation="sdpa"
     )
     merged = PeftModel.from_pretrained(base, args.adapter_path).merge_and_unload()
     merged.save_pretrained(out_dir)

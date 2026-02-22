@@ -23,6 +23,7 @@ Typical usage:
 
 import argparse
 import json
+import os
 from pathlib import Path
 
 import lm_eval
@@ -65,8 +66,20 @@ def best_metric(task_result: dict) -> tuple[str, float] | tuple[None, None]:
     return None, None
 
 
+def resolve_model_path(model_id: str) -> str:
+    """Return local snapshot path if cached, otherwise return model_id for hub download."""
+    hf_home = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface"))
+    slug = "models--" + model_id.replace("/", "--")
+    snapshots_dir = hf_home / "hub" / slug / "snapshots"
+    if snapshots_dir.exists():
+        snapshots = sorted(snapshots_dir.iterdir())
+        if snapshots:
+            return str(snapshots[-1])
+    return model_id
+
+
 def build_model_args(args: argparse.Namespace) -> str:
-    parts = [f"pretrained={args.base_model}"]
+    parts = [f"pretrained={resolve_model_path(args.base_model)}"]
     if args.adapter_path:
         parts.append(f"peft={args.adapter_path}")
         # Use the IT tokenizer saved alongside the adapter (has chat_template).
@@ -76,7 +89,7 @@ def build_model_args(args: argparse.Namespace) -> str:
     # dtype="auto" parameter which (after patching huggingface.py) correctly
     # maps to torch_dtype= in from_pretrained. Passing it again causes a
     # "multiple values for keyword argument 'torch_dtype'" error.
-    parts.append("attn_implementation=eager")
+    parts.append("attn_implementation=sdpa")
     return ",".join(parts)
 
 
