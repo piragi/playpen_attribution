@@ -274,13 +274,15 @@ runs/smoltalk_v4/
 
 1. **Data efficiency ratio**: How many random examples = 10k quality examples on GSM8K? Run random arm at 20k and 30k. If 30k random ≈ 10k quality, that is a 3× data efficiency gain.
 
-2. **Does the probe generalise across categories?** The probe is trained on math+DA attribution scores. Would it correctly rank reasoning or coding examples? Requires a separate attribution run with a reasoning query.
+2. **Does the probe generalise across categories?** The probe is trained on math+DA attribution scores. Would it correctly rank reasoning or coding examples? Requires a separate attribution run with a reasoning query. We tried some more general probes but found them lacking.
 
-3. **Probe R² ceiling**: R²=0.71 with 5k training examples. Does it improve with more training data? The pool is fundamentally limited to the train split size.
+3. **Probe R² ceiling**: R²=0.71 with 5k training examples. Does it improve with more training data? The pool is fundamentally limited to the train split size. Also what is the min/max of data needed here?
 
 4. **Quality label ablation**: Can a binary probe (good/excellent vs poor) trained without any attribution match the performance of the attribution probe? If yes, Bergson is unnecessary and quality labels alone suffice.
 
 5. **Selection rate sensitivity**: Quality arm = top-10k of 30k (33%). What happens at top-5k (17%) — does tighter selection improve GSM8K further or hurt coverage?
+
+6. **Length Stratification Necessary?** The length stratification for the random arm is nice if we want to control for not just selecting longer sequences by the probe and hence getting better performance. But we should also try just a totally random subset to know whether we introduced some artificial depracation of quality
 
 ---
 
