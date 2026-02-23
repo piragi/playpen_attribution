@@ -205,8 +205,8 @@ def make_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--batch-size",
-        type=int,
-        default=8,
+        type=str,
+        default="8",
     )
     parser.add_argument(
         "--apply-chat-template",

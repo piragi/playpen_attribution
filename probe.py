@@ -16,6 +16,7 @@ Run AFTER score.py:
 from __future__ import annotations
 
 import json
+import os
 import pickle
 from pathlib import Path
 
@@ -28,17 +29,35 @@ from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import train_test_split
 from transformers import AutoModelForCausalLM
 
+os.environ.setdefault("HF_HOME", "/workspace/.hf_home")
+
+
+def resolve_model_path(model_id: str) -> str:
+    hf_home = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface"))
+    slug = "models--" + model_id.replace("/", "--")
+    snapshots_dir = hf_home / "hub" / slug / "snapshots"
+    if snapshots_dir.exists():
+        snapshots = sorted(snapshots_dir.iterdir())
+        if snapshots:
+            return str(snapshots[-1])
+    return model_id
+
 CONFIG = {
-    "manifest_path": "runs/smoltalk_v2/manifest.json",
-    "scores_dir": "runs/smoltalk_v2/scores",
-    "output_dir": "runs/smoltalk_v2/probe",
-    # Ablation: set to True to use binary quality labels (good/excellent=1, else=0)
-    # instead of Bergson attribution scores. No score.py run needed in this mode.
+    "manifest_path": "runs/smoltalk_v4/manifest.json",
+    "output_dir": "runs/smoltalk_v4/probe",
+    # List of (name, scores_dir) pairs — one probe is trained per entry.
+    # Embeddings are extracted once and reused for all probes.
+    # Set to None to fall back to single-probe mode using scores_dir below.
+    "probes": [
+        {"name": "math_da", "scores_dir": "runs/smoltalk_v4/scores_math_da"},
+    ],
+    # Single-probe fallback (used when probes is None).
+    "scores_dir": "runs/smoltalk_v3_math/scores",
+    # Ablation: set to True to use binary quality labels instead of Bergson scores.
     "use_quality_labels": False,
-    # Layer to extract from (0-indexed). GemmaScope chose layer 17 for gemma-3-1b-pt;
-    # start there. Try 14 if R² is low.
+    # Layer to extract from (0-indexed).
     "extraction_layer": 17,
-    "ridge_alpha": 1.0,
+    "ridge_alpha": 100.0,
     "val_frac": 0.20,
     "seed": 42,
     "batch_size": 64,
@@ -118,6 +137,79 @@ def extract_embeddings(
     return np.concatenate(all_embeddings, axis=0)   # (n, d_model)
 
 
+def load_scores_from_dir(scores_dir: str, n_pool: int) -> np.ndarray:
+    """Load row_diagnostics.jsonl and return a (n_pool,) score array."""
+    diag_path = Path(scores_dir) / "row_diagnostics.jsonl"
+    if not diag_path.exists():
+        raise FileNotFoundError(
+            f"Scores not found: {diag_path}\n"
+            f"Run: uv run score.py --query-split <query_split> --output-dir {scores_dir}"
+        )
+    records = [json.loads(l) for l in diag_path.read_text().splitlines() if l.strip()]
+    records.sort(key=lambda r: r["index"])
+    scores = np.array([r["score"] for r in records], dtype=np.float32)
+    if n_pool != len(scores):
+        raise ValueError(f"Pool size {n_pool} != scores size {len(scores)} in {scores_dir}.")
+    return scores
+
+
+def fit_probe(
+    embeddings: np.ndarray,
+    scores_y: np.ndarray,
+    cfg: dict,
+    probe_name: str,
+    out_dir: Path,
+    scores_source: str,
+    base_model: str,
+) -> None:
+    """Fit and save one Ridge probe."""
+    idx = np.arange(len(embeddings))
+    train_idx, val_idx = train_test_split(idx, test_size=cfg["val_frac"], random_state=cfg["seed"])
+
+    X_train, X_val = embeddings[train_idx], embeddings[val_idx]
+    y_train, y_val = scores_y[train_idx], scores_y[val_idx]
+
+    print(f"\n--- Probe: {probe_name} ---")
+    print(f"Fitting Ridge(alpha={cfg['ridge_alpha']}) on {len(train_idx):,} examples ...")
+    probe = Ridge(alpha=cfg["ridge_alpha"])
+    probe.fit(X_train, y_train)
+
+    y_pred_val = probe.predict(X_val)
+    r2 = float(probe.score(X_val, y_val))
+    r, p = pearsonr(y_val.astype(float), y_pred_val.astype(float))
+    y_pred_train = probe.predict(X_train)
+    r2_train = float(probe.score(X_train, y_train))
+    r_train, _ = pearsonr(y_train.astype(float), y_pred_train.astype(float))
+
+    print(f"Validation (n={len(val_idx):,}):")
+    print(f"  R²        = {r2:.4f}")
+    print(f"  Pearson r = {r:.4f}  (p={p:.2e})")
+    print(f"Train (sanity): R²={r2_train:.4f}  r={r_train:.4f}")
+    if r2 < 0.05:
+        print(f"  WARNING: R² < 0.05 for probe '{probe_name}'.")
+
+    probe_path = out_dir / f"probe_{probe_name}.pkl"
+    with probe_path.open("wb") as f:
+        pickle.dump(probe, f)
+
+    meta = {
+        "base_model": base_model,
+        "probe_name": probe_name,
+        "extraction_layer": cfg["extraction_layer"],
+        "ridge_alpha": cfg["ridge_alpha"],
+        "n_train": int(len(train_idx)),
+        "n_val": int(len(val_idx)),
+        "mode": "attribution_scores",
+        "val_r2": r2,
+        "val_pearson_r": float(r),
+        "train_r2": r2_train,
+        "embeddings_path": str(out_dir / "pool_embeddings.npy"),
+        "scores_source": scores_source,
+    }
+    (out_dir / f"probe_meta_{probe_name}.json").write_text(json.dumps(meta, indent=2))
+    print(f"Saved probe → {probe_path}")
+
+
 def main() -> None:
     cfg = CONFIG
     np.random.seed(cfg["seed"])
@@ -128,52 +220,15 @@ def main() -> None:
     manifest = json.loads(Path(cfg["manifest_path"]).read_text())
     base_model = manifest["base_model"]
 
-    # --- Load pool dataset ---
     pool_path = Path(manifest["splits"]["score_pool"]["path"])
     pool_ds = load_from_disk(str(pool_path))
     print(f"Pool: {len(pool_ds):,} examples")
 
-    # --- Load targets: Bergson attribution scores OR binary quality labels ---
-    use_quality_labels = cfg.get("use_quality_labels", False)
-    if use_quality_labels:
-        if "quality" not in pool_ds.column_names:
-            raise ValueError(
-                "Pool dataset has no 'quality' column. "
-                "Re-run build_sft_data.py with smol-magpie-ultra to get quality labels."
-            )
-        quality_ok = {"good", "excellent"}
-        scores_y = np.array(
-            [1.0 if q in quality_ok else 0.0 for q in pool_ds["quality"]],
-            dtype=np.float32,
-        )
-        pos = int(scores_y.sum())
-        print(f"Quality labels: {pos:,} positive (good/excellent), {len(scores_y)-pos:,} negative")
-        print("  (ablation mode: no attribution scores needed)")
-    else:
-        diag_path = Path(cfg["scores_dir"]) / "row_diagnostics.jsonl"
-        if not diag_path.exists():
-            raise FileNotFoundError(
-                f"Scores not found: {diag_path}\n"
-                "Run score.py first:\n"
-                f"  uv run score.py --adapter-path {Path(cfg['scores_dir']).parent}/adapter "
-                f"--output-dir {cfg['scores_dir']}"
-            )
-        records = [json.loads(l) for l in diag_path.read_text().splitlines() if l.strip()]
-        records.sort(key=lambda r: r["index"])
-        scores_y = np.array([r["score"] for r in records], dtype=np.float32)
-        if len(pool_ds) != len(scores_y):
-            raise ValueError(
-                f"Pool size {len(pool_ds)} != scores size {len(scores_y)}. "
-                "Re-run score.py against the current attr_pool."
-            )
-        print(f"Loaded {len(scores_y):,} attribution scores")
-        print(f"  range [{scores_y.min():.4f}, {scores_y.max():.4f}]  mean={scores_y.mean():.4f}")
-
-    # --- Extract embeddings (or reuse cached) ---
     out_dir = Path(cfg["output_dir"])
     out_dir.mkdir(parents=True, exist_ok=True)
-    emb_path = out_dir / "pool_embeddings.npy"
 
+    # --- Extract embeddings once (reused for all probes) ---
+    emb_path = out_dir / "pool_embeddings.npy"
     if emb_path.exists():
         print(f"\nReusing cached embeddings from {emb_path}")
         embeddings = np.load(str(emb_path))
@@ -186,7 +241,7 @@ def main() -> None:
             captured["acts"] = output[0] if isinstance(output, tuple) else output
 
         model = AutoModelForCausalLM.from_pretrained(
-            base_model, torch_dtype=dtype, device_map=device, attn_implementation="sdpa"
+            resolve_model_path(base_model), torch_dtype=dtype, device_map=device, attn_implementation="sdpa"
         )
         model.eval()
         model.config.use_cache = False
@@ -204,65 +259,35 @@ def main() -> None:
         np.save(str(emb_path), embeddings)
         print(f"Saved embeddings → {emb_path}")
 
-    # --- Train Ridge probe ---
-    idx = np.arange(len(embeddings))
-    train_idx, val_idx = train_test_split(idx, test_size=cfg["val_frac"], random_state=cfg["seed"])
+    # --- Train probes ---
+    use_quality_labels = cfg.get("use_quality_labels", False)
+    probe_specs = cfg.get("probes")  # list[{"name": str, "scores_dir": str}] or None
 
-    X_train, X_val = embeddings[train_idx], embeddings[val_idx]
-    y_train, y_val = scores_y[train_idx], scores_y[val_idx]
-
-    print(f"\nFitting Ridge(alpha={cfg['ridge_alpha']}) on {len(train_idx):,} examples ...")
-    probe = Ridge(alpha=cfg["ridge_alpha"])
-    probe.fit(X_train, y_train)
-
-    # --- Evaluate ---
-    y_pred_val = probe.predict(X_val)
-    r2 = float(probe.score(X_val, y_val))
-    r, p = pearsonr(y_val.astype(float), y_pred_val.astype(float))
-
-    y_pred_train = probe.predict(X_train)
-    r2_train = float(probe.score(X_train, y_train))
-    r_train, _ = pearsonr(y_train.astype(float), y_pred_train.astype(float))
-
-    print(f"\nValidation (n={len(val_idx):,}):")
-    print(f"  R²        = {r2:.4f}")
-    print(f"  Pearson r = {r:.4f}  (p={p:.2e})")
     if use_quality_labels:
-        auc = float(roc_auc_score(y_val, y_pred_val))
-        acc = float(((y_pred_val > 0.5) == y_val).mean())
-        print(f"  AUC       = {auc:.4f}")
-        print(f"  Accuracy  = {acc:.4f}")
-    print(f"Train (sanity): R²={r2_train:.4f}  r={r_train:.4f}")
-
-    if not use_quality_labels and r2 < 0.05:
-        print(
-            "\nWARNING: R² < 0.05 — probe is not learning the attribution direction well.\n"
-            "  Try a different extraction_layer (e.g., 14) or check that score.py used\n"
-            "  the current attr_query."
+        if "quality" not in pool_ds.column_names:
+            raise ValueError("Pool dataset has no 'quality' column.")
+        quality_ok = {"good", "excellent"}
+        scores_y = np.array(
+            [1.0 if q in quality_ok else 0.0 for q in pool_ds["quality"]], dtype=np.float32
         )
+        pos = int(scores_y.sum())
+        print(f"Quality labels: {pos:,} positive, {len(scores_y)-pos:,} negative")
+        fit_probe(embeddings, scores_y, cfg, "quality_labels", out_dir, "quality_labels", base_model)
 
-    # --- Save probe ---
-    probe_fname = "probe_quality_labels.pkl" if use_quality_labels else "probe.pkl"
-    probe_path = out_dir / probe_fname
-    with probe_path.open("wb") as f:
-        pickle.dump(probe, f)
-    print(f"\nSaved probe → {probe_path}")
+    elif probe_specs:
+        for spec in probe_specs:
+            name, scores_dir = spec["name"], spec["scores_dir"]
+            scores_y = load_scores_from_dir(scores_dir, len(pool_ds))
+            print(f"\nScores [{name}]: range [{scores_y.min():.4f}, {scores_y.max():.4f}]  mean={scores_y.mean():.4f}")
+            fit_probe(embeddings, scores_y, cfg, name, out_dir,
+                      str(Path(scores_dir) / "row_diagnostics.jsonl"), base_model)
 
-    meta = {
-        "base_model": base_model,
-        "extraction_layer": cfg["extraction_layer"],
-        "ridge_alpha": cfg["ridge_alpha"],
-        "n_train": int(len(train_idx)),
-        "n_val": int(len(val_idx)),
-        "mode": "quality_labels" if use_quality_labels else "attribution_scores",
-        "val_r2": r2,
-        "val_pearson_r": float(r),
-        "train_r2": r2_train,
-        "embeddings_path": str(emb_path),
-        "scores_source": "quality_labels" if use_quality_labels else str(diag_path),
-    }
-    (out_dir / "probe_meta.json").write_text(json.dumps(meta, indent=2))
-    print(f"Saved metadata → {out_dir / 'probe_meta.json'}")
+    else:
+        scores_y = load_scores_from_dir(cfg["scores_dir"], len(pool_ds))
+        print(f"Loaded {len(scores_y):,} attribution scores")
+        print(f"  range [{scores_y.min():.4f}, {scores_y.max():.4f}]  mean={scores_y.mean():.4f}")
+        fit_probe(embeddings, scores_y, cfg, "probe", out_dir,
+                  str(Path(cfg["scores_dir"]) / "row_diagnostics.jsonl"), base_model)
     print("\nNext: uv run generate_continued_dataset.py")
 
 

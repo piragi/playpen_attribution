@@ -36,15 +36,18 @@ CONFIG = {
     "base_model": "HuggingFaceTB/SmolLM2-1.7B",      # model weights for training
     "tokenizer_model": "HuggingFaceTB/SmolLM2-1.7B-Instruct",  # tokenizer for chat template (same vocab)
     "max_length": 2048,
+    # Only stream rows from these categories (set to None for all categories).
+    "category_filter": {"math", "data-analysis"},
     # Split sizes (rows, not tokens)
-    "train_size": 1_000,
-    "val_size": 2_000,
-    "attr_pool_size": 15_000,
+    "train_size": 5_000,
+    "val_size": 500,
+    # Set to 0 to score the train split itself (score_pool → train in manifest).
+    "attr_pool_size": 0,
     # Attribution query composition (handled by rebuild_attr_query.py for v2)
     "query_smol_size": 0,     # disabled: rebuild_attr_query.py builds attr_query separately
     "query_gsm8k_size": 0,
     "query_arc_size": 0,
-    "output_dir": "runs/smoltalk_v2",
+    "output_dir": "runs/smoltalk_v4",
     "seed": 42,
 }
 
@@ -123,8 +126,11 @@ def build_smoltalk_splits(tokenizer: Any, cfg: dict) -> tuple[Dataset, Dataset, 
     gather_target = needed * 2
     rows: list[dict] = []
     raw_rows_seen = 0
+    category_filter = cfg.get("category_filter")
     for row in raw:
         raw_rows_seen += 1
+        if category_filter and row.get("category", "") not in category_filter:
+            continue
         messages = row.get("messages") or row.get("conversations") or []
         if not messages:
             continue
@@ -339,16 +345,17 @@ def main() -> None:
         print(f"  {name}: {len(ds):,} rows, {total_tokens / 1e6:.1f}M tokens → {path}")
 
     # Write manifest for score.py
+    # When attr_pool_size=0, score the train split directly.
+    score_pool_info = splits_info.get("attr_pool", splits_info["train"])
     manifest = {
         "base_model": cfg["base_model"],
-        "tokenizer_model": cfg["tokenizer_model"],
         "max_length": cfg["max_length"],
         "dataset": cfg["dataset_name"],
         "dataset_config": cfg["dataset_config"],
         "raw_rows_consumed": raw_rows_consumed,  # used by build_continuation_data.py to skip ahead
         "splits": {
             # score.py uses score_pool + attr_query
-            "score_pool": splits_info["attr_pool"],
+            "score_pool": score_pool_info,
             # attr_query populated by rebuild_attr_query.py (may not exist yet)
             **( {"attr_query": splits_info["attr_query"]} if "attr_query" in splits_info else {} ),
             # full train/val for reference

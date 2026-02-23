@@ -384,13 +384,13 @@ def build_subsets(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Minimal Bergson scoring pipeline.")
-    parser.add_argument("--manifest", type=str, default="runs/smoltalk_v1/manifest.json")
+    parser.add_argument("--manifest", type=str, default="runs/smoltalk_v4/manifest.json")
     parser.add_argument("--pool-split", type=str, default="score_pool")
     parser.add_argument("--query-split", type=str, default="attr_query")
     parser.add_argument("--adapter-path", type=str, default=None,
                         help="PEFT adapter path. If omitted, --base-model is used directly.")
-    parser.add_argument("--base-model", type=str, default="google/gemma-3-1b-pt")
-    parser.add_argument("--output-dir", type=str, default="runs/smoltalk_v1/attribution")
+    parser.add_argument("--base-model", type=str, default="HuggingFaceTB/SmolLM2-1.7B")
+    parser.add_argument("--output-dir", type=str, default="runs/smoltalk_v4/scores_math_da")
     parser.add_argument("--token-batch-size", type=int, default=2048)
     parser.add_argument("--projection-dim", type=int, default=32)
     parser.add_argument("--preconditioning-mode", choices=["none", "query", "mixed"], default="query")
