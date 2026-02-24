@@ -13,9 +13,9 @@ The pipeline:
 2. **Finetune scoring adapter**: LoRA SFT on train split → adapter used by Bergson attribution.
 3. **Attribution**: Bergson scores each pool example by influence toward a high-quality attr_query (smol-magpie-ultra, good/excellent, math+DA, disjoint from pool).
 4. **Probe**: Fit Ridge Regression on layer-17 residual stream embeddings of the scored pool → predict attribution scores.
-5. **Generate continuation datasets**: Apply probe to 30k new smol-magpie-ultra rows → select top-10k (quality arm) + random-10k length-stratified (random arm).
-6. **Finetune 2 arms from base**: quality arm, random arm.
-7. **Eval**: ARC, HellaSwag, WinoGrande, IFEval, GSM8K — compare arms.
+5. **Generate continuation datasets**: Apply probe to 30k new smol-magpie-ultra rows → select top-10k quality reference + scaled quality subsets (default: 80%, 50%) + two random baselines (token-matched, token+category-matched, fixed at 10k rows).
+6. **Finetune arms from base**: quality reference/scales + both random baselines.
+7. **Eval**: ARC, HellaSwag, WinoGrande, IFEval, GSM8K — compare all arms.
 
 Core claim: **Residual stream probing makes data attribution scalable** — one forward pass + linear probe replaces expensive per-example attribution at inference time.
 
@@ -80,6 +80,17 @@ The key unanswered question is **how much random data is needed to match the qua
 
 To run this experiment: increase `random_size` in `generate_continued_dataset.py` (the pool is already scored; no re-attribution needed) and retrain. If random needs 30k to match quality's 10k, that is a **3× data efficiency gain** from probe selection.
 
+### Evidence status (current)
+
+The +5.2 GSM8K delta in v4 is **encouraging but provisional**, not yet a claim-grade validation of the core hypothesis.
+
+Why provisional:
+- v4 historical baseline had a substantial token-budget mismatch versus quality (quality was longer on average), and length is strongly correlated with attribution score.
+- v4 historical baseline also had category-mix mismatch (quality was more math-heavy), which can directly affect GSM8K.
+- Result is currently a single-run comparison; no seed-robust confidence interval yet.
+
+Interpretation: treat v4 as a strong signal worth pursuing. The pipeline now emits matched random baselines (token and token+category), and these reruns are required before concluding the probe itself is the primary cause of the gain.
+
 ---
 
 ## 4) Active Pipeline Scripts
@@ -91,7 +102,7 @@ To run this experiment: increase `random_size` in `generate_continued_dataset.py
 | `finetune.py` | LoRA SFT on pre-tokenized data; saves IT tokenizer alongside adapter. |
 | `score.py` | Bergson gradient-based attribution; pool vs attr_query; supports PEFT adapters. Pool is the training data. |
 | `probe.py` | Extract layer-17 residual stream from pool → fit Ridge probe to attribution scores. Caches embeddings to avoid re-extraction. |
-| `generate_continued_dataset.py` | Score new smol-magpie-ultra rows with probe → quality arm (top-N) + random baseline (length-stratified). |
+| `generate_continued_dataset.py` | Score new smol-magpie-ultra rows with probe → quality reference (top-N), optional scaled quality subsets, and two fixed-size random baselines (token-matched, token+category-matched). |
 | `eval_harness.py` | lm-eval benchmark evaluation (ARC, HellaSwag, WinoGrande, IFEval, GSM8K). |
 | `vram.py` | VRAM profiler for SmolLM2-1.7B. |
 
@@ -104,8 +115,8 @@ build_sft_data.py
   → score.py (pool = train split)
   → probe.py  ← check R² here before proceeding; target R² > 0.5
   → generate_continued_dataset.py
-  → finetune.py (quality arm) + finetune.py (random arm)
-  → eval_harness.py (quality) + eval_harness.py (random)
+  → finetune.py (quality arm + matched random baselines)
+  → eval_harness.py (all arms)
 ```
 
 ---
@@ -143,9 +154,13 @@ At alpha=1.0 the probe receives an ill-conditioned matrix warning (rcond ≈ 1e-
 
 The continuation pool (generate_continued_dataset.py) is filtered to the same categories as the attribution query (math + data-analysis). This is intentional: the probe was trained to predict scores under a math+DA query, so it will correctly rank math+DA examples. Applying it to unrelated categories (e.g. creative writing) would produce meaningless scores.
 
-### Length-stratified random arm
+### Matched random baselines
 
-The random baseline samples by quintile of sequence length (not uniform random). This controls for the length confound: attribution scores correlate with sequence length (longer sequences produce larger gradient norms), so a uniform random baseline would have a different length distribution than the quality arm, conflating length with quality. The stratified baseline makes the comparison fair.
+`generate_continued_dataset.py` now emits two controlled random baselines per quality arm:
+- `random_token_match`: same row count, random draw from the quality-excluded remainder, then simple token-increase swaps if the draw is below the quality token budget.
+- `random_token_cat_match`: same row count and same category proportions as quality, with category-preserving token-increase swaps if needed.
+
+Both baselines are drawn from the quality-excluded remainder. If an exact `>= target tokens` match is impossible, the script records this in `continuation_manifest.json` (`met_target_tokens=false`, `max_possible_tokens=<...>`).
 
 ---
 
@@ -153,13 +168,13 @@ The random baseline samples by quintile of sequence length (not uniform random).
 
 ### Tokenizer must match model
 
-The attr_query tokenizer bug burned time: `rebuild_attr_query.py` reads `tokenizer_model` from the manifest with a hardcoded Gemma default (`"google/gemma-3-1b-it"`). If `tokenizer_model` is absent from the manifest, the default kicks in, producing token IDs up to 255,969 — out of bounds for SmolLM2's 49,152-token vocabulary → CUDA index assertion error.
+The attr_query tokenizer bug burned time: `rebuild_attr_query.py` previously derived the tokenizer from a fallback model when `tokenizer_model` was missing in the manifest. With SmolLM2 this can produce out-of-vocab token IDs and fail with CUDA index assertions.
 
-Fix: `manifest.get("tokenizer_model")` (returns `None`, not the Gemma default), then derive from `base_model + "-Instruct"`.
+Fix: read `manifest.get("tokenizer_model")` first, and if absent derive tokenizer from `base_model + "-Instruct"` (for SmolLM2).
 
 ### ensure_adapter_config writes the wrong model config
 
-`score.py` calls `ensure_adapter_config()` which writes `config.json` into the adapter directory from the `--base-model` argument. If `--base-model` defaults to the wrong model (e.g., old default was `google/gemma-3-1b-pt`), the config.json is wrong and stays wrong on subsequent runs (the function only writes if the file doesn't exist). Current default: `HuggingFaceTB/SmolLM2-1.7B`. If this is ever wrong, delete `config.json` from the adapter directory.
+`score.py` calls `ensure_adapter_config()` which writes `config.json` into the adapter directory from the `--base-model` argument. If `--base-model` is wrong, the config.json is wrong and stays wrong on subsequent runs (the function only writes if the file doesn't exist). Current default: `HuggingFaceTB/SmolLM2-1.7B`. If this is ever wrong, delete `config.json` from the adapter directory.
 
 ### Base model + IT tokenizer pattern
 
@@ -169,11 +184,10 @@ Tokenizer:   AutoTokenizer.from_pretrained("HuggingFaceTB/SmolLM2-1.7B-Instruct"
 ```
 
 IT model naming convention for SmolLM2: base = `SmolLM2-1.7B` → instruct = `SmolLM2-1.7B-Instruct`.
-(Gemma pattern was `-pt` → `-it`; SmolLM2 has no `-pt` suffix.)
 
-### resolve_model_path() pattern
+### Model loading pattern
 
-All scripts use `resolve_model_path()` which checks the local HF cache at `/workspace/.hf_home` before falling back to hub download. Required because `HF_HOME` is non-standard in this environment.
+Scripts now pass model IDs directly to `from_pretrained(...)` and rely on the Hugging Face cache machinery. `HF_HOME` is set once (if not already set) to a standard local cache path.
 
 ### Attention implementation
 
@@ -238,6 +252,7 @@ uv run eval_harness.py \
 | `category_filter` | `{"math", "data-analysis"}` |
 | `pool_size` | 30,000 |
 | `quality_size` | 10,000 |
+| `quality_scales` | `[1.0, 0.8, 0.5]` |
 | `random_size` | 10,000 |
 
 ---
@@ -260,12 +275,21 @@ runs/smoltalk_v4/
     probe_meta_math_da.json
   continuation/
     quality_math_da/  10k rows — top-10k by probe score
-    random/           10k rows — length-stratified from non-quality remainder
+    quality_math_da_80pct/     8k rows — top-80% of quality reference
+    quality_math_da_50pct/     5k rows — top-50% of quality reference
+    random_token_match/      10k rows — token-budget matched random baseline
+    random_token_cat_match/  10k rows — token+category matched random baseline
   adapter_quality_math_da/
-  adapter_random/
+  adapter_quality_math_da_80pct/
+  adapter_quality_math_da_50pct/
+  adapter_random_token_match/
+  adapter_random_token_cat_match/
   evals/
     quality_math_da.json        ← GSM8K: 0.2161
-    random.json                 ← GSM8K: 0.1638
+    quality_math_da_80pct.json
+    quality_math_da_50pct.json
+    random_token_match.json
+    random_token_cat_match.json
 ```
 
 ---
@@ -282,7 +306,7 @@ runs/smoltalk_v4/
 
 5. **Selection rate sensitivity**: Quality arm = top-10k of 30k (33%). What happens at top-5k (17%) — does tighter selection improve GSM8K further or hurt coverage?
 
-6. **Length Stratification Necessary?** The length stratification for the random arm is nice if we want to control for not just selecting longer sequences by the probe and hence getting better performance. But we should also try just a totally random subset to know whether we introduced some artificial depracation of quality
+6. **Unmatched random ablation?** In addition to matched random baselines, do we also want a pure uniform-random arm (no token/category matching) as an intentionally weak baseline for context?
 
 ---
 

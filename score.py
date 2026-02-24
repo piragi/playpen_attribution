@@ -2,22 +2,8 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import shutil
 from pathlib import Path
-
-os.environ.setdefault("HF_HOME", "/workspace/.hf_home")
-
-
-def resolve_model_path(model_id: str) -> str:
-    hf_home = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface"))
-    slug = "models--" + model_id.replace("/", "--")
-    snapshots_dir = hf_home / "hub" / slug / "snapshots"
-    if snapshots_dir.exists():
-        snapshots = sorted(snapshots_dir.iterdir())
-        if snapshots:
-            return str(snapshots[-1])
-    return model_id
 
 import numpy as np
 from bergson.build import build
@@ -26,7 +12,15 @@ from bergson.data import load_scores
 from bergson.reduce import reduce
 from bergson.score.score import score_dataset
 from datasets import Dataset, load_from_disk
-from transformers import AutoConfig, AutoTokenizer
+from transformers import AutoConfig
+
+from pipeline_common import (
+    DEFAULT_BASE_MODEL,
+    ensure_hf_home_env,
+    infer_instruct_tokenizer_model,
+)
+
+ensure_hf_home_env()
 
 
 def remove_path(path: Path) -> None:
@@ -54,51 +48,16 @@ def ensure_adapter_config(adapter_path: Path, base_model: str) -> None:
         AutoConfig.from_pretrained(base_model).save_pretrained(adapter_path)
 
 
-def build_finetune_aligned_dataset(
-    src_path: Path,
-    dst_path: Path,
-    tokenizer_name: str,
-    max_length: int,
-) -> Path:
-    ds = load_from_disk(str(src_path))
-    tok = AutoTokenizer.from_pretrained(tokenizer_name)
-    eos = tok.eos_token or ""
-
-    def to_features(row: dict) -> dict:
-        prompt = str(row["prompt"])
-        completion = str(row["completion"])
-        if eos and not completion.endswith(eos):
-            completion = completion + eos
-
-        prompt_ids = tok(prompt)["input_ids"]
-        full_ids = tok(prompt + completion)["input_ids"][:max_length]
-        prompt_len = min(len(prompt_ids), len(full_ids))
-        labels = [-100] * prompt_len + full_ids[prompt_len:]
-        return {
-            "input_ids": full_ids,
-            "labels": labels,
-            "length": len(full_ids),
-        }
-
-    out = ds.map(to_features, remove_columns=ds.column_names)
-    dst_path.parent.mkdir(parents=True, exist_ok=True)
-    if dst_path.exists():
-        remove_path(dst_path)
-    out.save_to_disk(str(dst_path))
-    return dst_path
-
-
 def make_index_config(
     run_path: Path,
     data_path: Path,
     args: argparse.Namespace,
     skip_preconditioners: bool,
 ) -> IndexConfig:
-    model_path = args.adapter_path or resolve_model_path(args.base_model)
+    model_path = args.adapter_path or args.base_model
     # Use IT model for tokenizer (same vocab, has chat template); fall back to base.
-    it_model = args.base_model if args.base_model.endswith("-Instruct") \
-        else args.base_model + "-Instruct"
-    tokenizer_path = args.adapter_path or resolve_model_path(it_model)
+    it_model = infer_instruct_tokenizer_model(args.base_model)
+    tokenizer_path = args.adapter_path or it_model
     return IndexConfig(
         run_path=str(run_path),
         model=model_path,
@@ -389,16 +348,11 @@ def main() -> None:
     parser.add_argument("--query-split", type=str, default="attr_query")
     parser.add_argument("--adapter-path", type=str, default=None,
                         help="PEFT adapter path. If omitted, --base-model is used directly.")
-    parser.add_argument("--base-model", type=str, default="HuggingFaceTB/SmolLM2-1.7B")
+    parser.add_argument("--base-model", type=str, default=DEFAULT_BASE_MODEL)
     parser.add_argument("--output-dir", type=str, default="runs/smoltalk_v4/scores_math_da")
     parser.add_argument("--token-batch-size", type=int, default=2048)
     parser.add_argument("--projection-dim", type=int, default=32)
     parser.add_argument("--preconditioning-mode", choices=["none", "query", "mixed"], default="query")
-    parser.add_argument(
-        "--tokenization-mode",
-        choices=["bergson_chat", "finetune_raw"],
-        default="bergson_chat",
-    )
     parser.add_argument("--mixing-coefficient", type=float, default=0.99)
     parser.add_argument("--score-mode", choices=["mean", "nearest"], default="mean")
     parser.add_argument("--unit-normalize", dest="unit_normalize", action="store_true")
@@ -428,7 +382,6 @@ def main() -> None:
     diagnostics_path = out / "row_diagnostics.jsonl"
     summary_path = out / "summary.json"
     subsets_dir = out / "subsets"
-    pretokenized_root = out / "_pretokenized_finetune"
 
     if not args.postprocess_only:
         to_clean = [
@@ -442,38 +395,22 @@ def main() -> None:
         ]
         if args.preconditioning_mode == "mixed":
             to_clean.extend([pool_pre, part_path(pool_pre)])
-        if args.tokenization_mode == "finetune_raw":
-            to_clean.append(pretokenized_root)
         for p in to_clean:
             if p.exists():
                 remove_path(p)
 
-        # Resolve the effective model path: adapter if given, else the base model itself.
-        # Overwrite args.adapter_path so all downstream calls (make_index_config etc.) see it.
+        # Resolve the effective model handle: adapter if given, else the base model ID.
+        # Overwrite args.adapter_path so downstream config uses one value consistently.
         if args.adapter_path:
             ensure_adapter_config(Path(args.adapter_path), args.base_model)
         else:
-            # No adapter: point directly at the cached base model snapshot.
+            # No adapter: use the base model ID directly.
             # Do NOT call ensure_adapter_config — it would create a local stub directory
             # with only config.json and no tokenizer files, causing tokenizer load failures.
-            args.adapter_path = resolve_model_path(args.base_model)
+            args.adapter_path = args.base_model
 
         pool_path = pool_source
         query_path = query_source
-        if args.tokenization_mode == "finetune_raw":
-            tokenizer_name = args.adapter_path if Path(args.adapter_path).exists() else args.base_model
-            pool_path = build_finetune_aligned_dataset(
-                src_path=pool_source,
-                dst_path=pretokenized_root / args.pool_split,
-                tokenizer_name=tokenizer_name,
-                max_length=args.token_batch_size,
-            )
-            query_path = build_finetune_aligned_dataset(
-                src_path=query_source,
-                dst_path=pretokenized_root / args.query_split,
-                tokenizer_name=tokenizer_name,
-                max_length=args.token_batch_size,
-            )
 
         use_query_pre = args.preconditioning_mode in {"query", "mixed"}
         if args.score_mode == "nearest":

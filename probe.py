@@ -1,22 +1,22 @@
 """Train a Ridge Regression probe to predict Bergson attribution scores from residual stream.
 
-Runs the base model (gemma-3-1b-pt) forward pass on the 50k attr_pool, extracts the
-mean-pooled residual stream at `extraction_layer` over response token positions only
+Runs the base model forward pass on the score pool, extracts the
+residual stream at `extraction_layer` over response token positions only
 (labels != -100), and fits a Ridge Regression to the continuous Bergson attribution scores.
 
-Reports R² and Pearson r on a held-out 20% split. Saves probe.pkl and the full embedding
-matrix (reused by generate_continued_dataset.py to avoid re-extracting).
+Reports R² and Pearson r on a held-out 20% split. Saves probe_<name>.pkl and
+the full embedding matrix (reused by generate_continued_dataset.py).
 
 Run AFTER score.py:
 
-    uv run score.py --adapter-path runs/smoltalk_v1/adapter \\
-        --output-dir runs/smoltalk_v1/scores
+    uv run score.py --manifest runs/smoltalk_v4/manifest.json \\
+        --adapter-path runs/smoltalk_v4/adapter \\
+        --output-dir runs/smoltalk_v4/scores_math_da
     uv run probe.py
 """
 from __future__ import annotations
 
 import json
-import os
 import pickle
 from pathlib import Path
 
@@ -25,22 +25,19 @@ import torch
 from datasets import load_from_disk
 from scipy.stats import pearsonr
 from sklearn.linear_model import Ridge
-from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import train_test_split
 from transformers import AutoModelForCausalLM
 
-os.environ.setdefault("HF_HOME", "/workspace/.hf_home")
+from pipeline_common import (
+    ATTN_IMPLEMENTATION,
+    ensure_hf_home_env,
+    last_response_token_positions,
+    pad_tokenized_batch,
+    pool_hidden_at_positions,
+    resolve_device_dtype,
+)
 
-
-def resolve_model_path(model_id: str) -> str:
-    hf_home = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface"))
-    slug = "models--" + model_id.replace("/", "--")
-    snapshots_dir = hf_home / "hub" / slug / "snapshots"
-    if snapshots_dir.exists():
-        snapshots = sorted(snapshots_dir.iterdir())
-        if snapshots:
-            return str(snapshots[-1])
-    return model_id
+ensure_hf_home_env()
 
 CONFIG = {
     "manifest_path": "runs/smoltalk_v4/manifest.json",
@@ -52,7 +49,7 @@ CONFIG = {
         {"name": "math_da", "scores_dir": "runs/smoltalk_v4/scores_math_da"},
     ],
     # Single-probe fallback (used when probes is None).
-    "scores_dir": "runs/smoltalk_v3_math/scores",
+    "scores_dir": "runs/smoltalk_v4/scores_math_da",
     # Ablation: set to True to use binary quality labels instead of Bergson scores.
     "use_quality_labels": False,
     # Layer to extract from (0-indexed).
@@ -63,16 +60,6 @@ CONFIG = {
     "batch_size": 64,
     "device": "auto",
 }
-
-
-def resolve_device(device_arg: str) -> tuple[str, torch.dtype]:
-    if device_arg == "auto":
-        if torch.cuda.is_available():
-            return "cuda", torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-        return "cpu", torch.float32
-    if device_arg == "cuda":
-        return "cuda", torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-    return device_arg, torch.float32
 
 
 def extract_embeddings(
@@ -98,36 +85,18 @@ def extract_embeddings(
         for start in range(0, n, batch_size):
             end = min(start + batch_size, n)
             batch = pool_ds.select(range(start, end))
-
-            # Pad to max length within this mini-batch
-            max_len = max(len(ids) for ids in batch["input_ids"])
-            ids_padded, lbl_padded = [], []
-            for ids, lbls in zip(batch["input_ids"], batch["labels"]):
-                pad = max_len - len(ids)
-                ids_padded.append(ids + [0] * pad)
-                lbl_padded.append(lbls + [-100] * pad)
-
-            ids_t = torch.tensor(ids_padded, dtype=torch.long, device=device)
-            lbl_t = torch.tensor(lbl_padded, dtype=torch.long)   # keep on CPU for index finding
+            ids_t, lbl_t = pad_tokenized_batch(
+                batch["input_ids"],
+                batch["labels"],
+                input_pad_token_id=0,
+                label_pad_token_id=-100,
+                device=device,
+            )
 
             model(input_ids=ids_t)
             hidden = captured["acts"]  # (batch, seq_len, d_model)
-
-            # Last response token: last position where labels != -100
-            # If somehow no response tokens exist, fall back to the final padded position.
-            batch_size_actual = lbl_t.shape[0]
-            last_resp_idx = torch.zeros(batch_size_actual, dtype=torch.long)
-            for i in range(batch_size_actual):
-                resp_positions = (lbl_t[i] != -100).nonzero(as_tuple=True)[0]
-                if len(resp_positions) > 0:
-                    last_resp_idx[i] = resp_positions[-1]
-                else:
-                    last_resp_idx[i] = lbl_t.shape[1] - 1
-
-            # Gather the hidden state at each example's last response position
-            idx = last_resp_idx.to(hidden.device).unsqueeze(-1).unsqueeze(-1)
-            idx = idx.expand(-1, 1, hidden.shape[-1])           # (batch, 1, d_model)
-            pooled = hidden.gather(dim=1, index=idx).squeeze(1) # (batch, d_model)
+            last_resp_idx = last_response_token_positions(lbl_t, label_pad_token_id=-100)
+            pooled = pool_hidden_at_positions(hidden, last_resp_idx)
 
             all_embeddings.append(pooled.float().cpu().numpy())
 
@@ -214,7 +183,7 @@ def main() -> None:
     cfg = CONFIG
     np.random.seed(cfg["seed"])
 
-    device, dtype = resolve_device(cfg["device"])
+    device, dtype = resolve_device_dtype(cfg["device"])
     print(f"Device: {device}, dtype: {dtype}")
 
     manifest = json.loads(Path(cfg["manifest_path"]).read_text())
@@ -241,7 +210,10 @@ def main() -> None:
             captured["acts"] = output[0] if isinstance(output, tuple) else output
 
         model = AutoModelForCausalLM.from_pretrained(
-            resolve_model_path(base_model), torch_dtype=dtype, device_map=device, attn_implementation="sdpa"
+            base_model,
+            torch_dtype=dtype,
+            device_map=device,
+            attn_implementation=ATTN_IMPLEMENTATION,
         )
         model.eval()
         model.config.use_cache = False

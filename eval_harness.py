@@ -10,28 +10,34 @@ Typical usage:
 
   # Base model (no chat template)
   uv run eval_harness.py \\
-    --base-model google/gemma-3-270m \\
+    --base-model HuggingFaceTB/SmolLM2-1.7B \\
     --output-json runs/base_eval.json
 
   # LoRA SFT model (chat template required)
   uv run eval_harness.py \\
-    --base-model google/gemma-3-270m \\
-    --adapter-path runs/smoltalk_v1/adapter \\
+    --base-model HuggingFaceTB/SmolLM2-1.7B \\
+    --adapter-path runs/smoltalk_v4/adapter \\
     --apply-chat-template \\
-    --output-json runs/smoltalk_v1/eval.json
+    --output-json runs/smoltalk_v4/eval.json
 """
 
 import argparse
 import json
-import os
 from pathlib import Path
 
 import lm_eval
 import torch
 import transformers
 
-# lm-eval 0.4.11 passes dtype= to from_pretrained but Gemma3ForCausalLM only
-# accepts torch_dtype=. Patch here so this survives uv sync / reinstalls.
+from pipeline_common import (
+    DEFAULT_BASE_MODEL,
+    ensure_hf_home_env,
+)
+
+ensure_hf_home_env()
+
+# lm-eval may pass dtype= to from_pretrained while some model classes only
+# accept torch_dtype=. Normalize this at runtime so eval works consistently.
 _orig_from_pretrained = transformers.AutoModelForCausalLM.from_pretrained
 
 def _from_pretrained_compat(*args, dtype=None, torch_dtype=None, **kwargs):
@@ -66,24 +72,11 @@ def best_metric(task_result: dict) -> tuple[str, float] | tuple[None, None]:
     return None, None
 
 
-def resolve_model_path(model_id: str) -> str:
-    """Return local snapshot path if cached, otherwise return model_id for hub download."""
-    hf_home = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface"))
-    slug = "models--" + model_id.replace("/", "--")
-    snapshots_dir = hf_home / "hub" / slug / "snapshots"
-    if snapshots_dir.exists():
-        snapshots = sorted(snapshots_dir.iterdir())
-        if snapshots:
-            return str(snapshots[-1])
-    return model_id
-
-
 def build_model_args(args: argparse.Namespace) -> str:
-    parts = [f"pretrained={resolve_model_path(args.base_model)}"]
+    parts = [f"pretrained={args.base_model}"]
     if args.adapter_path:
         parts.append(f"peft={args.adapter_path}")
         # Use the IT tokenizer saved alongside the adapter (has chat_template).
-        # Essential when base model is google/gemma-3-270m (no chat_template).
         parts.append(f"tokenizer={args.adapter_path}")
     # Do NOT pass torch_dtype/dtype here — lm-eval's HFLM.__init__ has its own
     # dtype="auto" parameter which (after patching huggingface.py) correctly
@@ -175,7 +168,7 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--base-model",
         type=str,
-        default="google/gemma-3-1b-pt",
+        default=DEFAULT_BASE_MODEL,
         help="HuggingFace base model ID or local path.",
     )
     parser.add_argument(

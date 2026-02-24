@@ -1,14 +1,13 @@
 """Prepare SmolTalk data for LoRA SFT + Bergson attribution.
 
-Loads smol-smoltalk, applies Gemma chat template with prompt masking,
-filters to max_length tokens, then produces three splits:
+Loads smol-magpie-ultra, applies the SmolLM2-Instruct chat template with
+prompt masking, filters to max_length tokens, then produces three splits:
 
   train/        SFT training data (Phase 1 model)
   val/          SFT validation data
-  attr_pool/    held-out attribution pool (scored in Phase 2)
+  attr_pool/    held-out attribution pool (optional; scored in Phase 2)
 
-Plus a benchmark attribution query set:
-  attr_query/   ARC-Challenge + WinoGrande formatted as instruct examples
+Attribution query is built separately with rebuild_attr_query.py.
 
 Each split stores:
   input_ids     List[int]   full tokenized conversation
@@ -30,11 +29,17 @@ from typing import Any
 from datasets import Dataset, load_dataset
 from transformers import AutoTokenizer
 
+from pipeline_common import DEFAULT_BASE_MODEL, ensure_hf_home_env, infer_instruct_tokenizer_model
+
+ensure_hf_home_env()
+
+_BASE_MODEL = DEFAULT_BASE_MODEL
+
 CONFIG = {
     "dataset_name": "HuggingFaceTB/smoltalk",
     "dataset_config": "smol-magpie-ultra",  # in-distribution; quality labels preserved
-    "base_model": "HuggingFaceTB/SmolLM2-1.7B",      # model weights for training
-    "tokenizer_model": "HuggingFaceTB/SmolLM2-1.7B-Instruct",  # tokenizer for chat template (same vocab)
+    "base_model": _BASE_MODEL,  # model weights for training
+    "tokenizer_model": infer_instruct_tokenizer_model(_BASE_MODEL),  # tokenizer for chat template
     "max_length": 2048,
     # Only stream rows from these categories (set to None for all categories).
     "category_filter": {"math", "data-analysis"},
@@ -43,10 +48,6 @@ CONFIG = {
     "val_size": 500,
     # Set to 0 to score the train split itself (score_pool → train in manifest).
     "attr_pool_size": 0,
-    # Attribution query composition (handled by rebuild_attr_query.py for v2)
-    "query_smol_size": 0,     # disabled: rebuild_attr_query.py builds attr_query separately
-    "query_gsm8k_size": 0,
-    "query_arc_size": 0,
     "output_dir": "runs/smoltalk_v4",
     "seed": 42,
 }
@@ -168,120 +169,6 @@ def build_smoltalk_splits(tokenizer: Any, cfg: dict) -> tuple[Dataset, Dataset, 
 
 
 # ---------------------------------------------------------------------------
-# Build benchmark attribution query
-# ---------------------------------------------------------------------------
-
-def _arc_row_to_instruct(row: dict, tokenizer: Any, max_length: int) -> dict | None:
-    """Convert one ARC-Challenge row to an instruct-formatted attribution example."""
-    choices = row["choices"]
-    labels_list = choices["label"]
-    texts = choices["text"]
-    answer_key = row["answerKey"]
-
-    options = "\n".join(f"{l}) {t}" for l, t in zip(labels_list, texts))
-    user_text = f"Answer the following question with just the letter of the correct option.\n\nQuestion: {row['question']}\n\n{options}"
-    assistant_text = answer_key
-
-    messages = [
-        {"role": "user", "content": user_text},
-        {"role": "assistant", "content": assistant_text},
-    ]
-    tok_out = _mask_prompt(messages, tokenizer, max_length)
-    return tok_out
-
-
-def _gsm8k_row_to_instruct(row: dict, tokenizer: Any, max_length: int) -> dict | None:
-    """Convert one GSM8K row to an instruct example.
-
-    The answer field contains the full step-by-step solution ending with '#### <number>',
-    which is exactly the reasoning trace we want as the supervised completion.
-    """
-    messages = [
-        {"role": "user", "content": row["question"]},
-        {"role": "assistant", "content": row["answer"]},
-    ]
-    tok_out = _mask_prompt(messages, tokenizer, max_length)
-    return tok_out
-
-
-def build_attr_query(tokenizer: Any, cfg: dict, raw_rows_consumed: int) -> Dataset:
-    """Build attribution query: smol-magpie-ultra (fresh rows) + GSM8K + ARC-Challenge.
-
-    smol-magpie-ultra: high-quality instruction data — the core quality signal.
-      Streamed from SmolTalk 'all' past raw_rows_consumed, guaranteeing no overlap
-      with train/val/pool splits.
-    GSM8K train: multi-step reasoning traces — selects for reasoning capability.
-    ARC-Challenge train: factual grounding — keeps some short Q&A signal.
-    """
-    rows: list[dict] = []
-
-    # --- smol-magpie-ultra: stream fresh rows past the consumed offset ---
-    n_smol = cfg["query_smol_size"]
-    print(f"Building attribution query: smol-magpie-ultra (skipping {raw_rows_consumed:,} rows) ...")
-    raw = load_dataset(cfg["dataset_name"], cfg["dataset_config"], split="train", streaming=True)
-    raw_seen = 0
-    smol_rows: list[dict] = []
-    for row in raw:
-        raw_seen += 1
-        if raw_seen <= raw_rows_consumed:
-            if raw_seen % 100_000 == 0:
-                print(f"  skipping... {raw_seen:,}/{raw_rows_consumed:,}", flush=True)
-            continue
-        if row.get("source") != "smol-magpie-ultra":
-            continue
-        messages = row.get("messages") or row.get("conversations") or []
-        if not messages:
-            continue
-        tok_out = _mask_prompt(messages, tokenizer, cfg["max_length"])
-        if tok_out is None:
-            continue
-        tok_out["magpie_score"] = _get_magpie_score(row)
-        smol_rows.append(tok_out)
-        if len(smol_rows) >= n_smol:
-            break
-    if len(smol_rows) < n_smol:
-        print(f"  WARNING: only found {len(smol_rows)} smol-magpie-ultra rows (wanted {n_smol})")
-    print(f"  {len(smol_rows)} smol-magpie-ultra examples")
-    rows.extend(smol_rows)
-
-    # --- GSM8K: multi-step reasoning traces (optional) ---
-    gsm_rows: list[dict] = []
-    n_gsm = cfg["query_gsm8k_size"]
-    if n_gsm > 0:
-        print(f"Building attribution query: GSM8K train ({n_gsm} examples) ...")
-        gsm = load_dataset("openai/gsm8k", "main", split="train")
-        for row in gsm:
-            tok_out = _gsm8k_row_to_instruct(row, tokenizer, cfg["max_length"])
-            if tok_out is not None:
-                tok_out["magpie_score"] = 0.0
-                gsm_rows.append(tok_out)
-            if len(gsm_rows) >= n_gsm:
-                break
-        print(f"  {len(gsm_rows)} GSM8K examples")
-        rows.extend(gsm_rows)
-
-    # --- ARC-Challenge: factual grounding (optional) ---
-    arc_rows: list[dict] = []
-    n_arc = cfg["query_arc_size"]
-    if n_arc > 0:
-        print(f"Building attribution query: ARC-Challenge train ({n_arc} examples) ...")
-        arc = load_dataset("allenai/ai2_arc", "ARC-Challenge", split="train")
-        for row in arc:
-            tok_out = _arc_row_to_instruct(row, tokenizer, cfg["max_length"])
-            if tok_out is not None:
-                tok_out["magpie_score"] = 0.0
-                arc_rows.append(tok_out)
-            if len(arc_rows) >= n_arc:
-                break
-        print(f"  {len(arc_rows)} ARC-Challenge examples")
-        rows.extend(arc_rows)
-
-    total = len(rows)
-    print(f"  attr_query total: {total} examples ({len(smol_rows)} smol + {len(gsm_rows)} GSM8K + {len(arc_rows)} ARC)")
-    return Dataset.from_list(rows)
-
-
-# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -290,9 +177,6 @@ SMOKE_CONFIG = {
     "train_size": 64,
     "val_size": 20,
     "attr_pool_size": 50,
-    "query_smol_size": 40,
-    "query_gsm8k_size": 0,
-    "query_arc_size": 0,
     "output_dir": "runs/smoke_test",
 }
 
@@ -318,7 +202,6 @@ def main() -> None:
         tokenizer.pad_token = tokenizer.eos_token
 
     train_ds, val_ds, attr_pool_ds, raw_rows_consumed = build_smoltalk_splits(tokenizer, cfg)
-    query_ds = build_attr_query(tokenizer, cfg, raw_rows_consumed)
 
     # Save splits
     splits_info: dict[str, dict] = {}
@@ -326,10 +209,9 @@ def main() -> None:
         ("train", train_ds),
         ("val", val_ds),
         ("attr_pool", attr_pool_ds),
-        ("attr_query", query_ds),
     ]:
         if len(ds) == 0:
-            print(f"  {name}: 0 rows — skipped (rebuild_attr_query.py will build this)")
+            print(f"  {name}: 0 rows — skipped")
             continue
         path = out / "data" / name
         if path.exists():
@@ -349,15 +231,14 @@ def main() -> None:
     score_pool_info = splits_info.get("attr_pool", splits_info["train"])
     manifest = {
         "base_model": cfg["base_model"],
+        "tokenizer_model": cfg["tokenizer_model"],
         "max_length": cfg["max_length"],
         "dataset": cfg["dataset_name"],
         "dataset_config": cfg["dataset_config"],
-        "raw_rows_consumed": raw_rows_consumed,  # used by build_continuation_data.py to skip ahead
+        "raw_rows_consumed": raw_rows_consumed,  # used by generate_continued_dataset.py to skip ahead
         "splits": {
             # score.py uses score_pool + attr_query
             "score_pool": score_pool_info,
-            # attr_query populated by rebuild_attr_query.py (may not exist yet)
-            **( {"attr_query": splits_info["attr_query"]} if "attr_query" in splits_info else {} ),
             # full train/val for reference
             "train": splits_info["train"],
             "val": splits_info["val"],
@@ -366,10 +247,11 @@ def main() -> None:
     manifest_path = out / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2))
     print(f"\nManifest written to: {manifest_path}")
+    run_dir = str(out)
     print("\nNext steps:")
-    print("  1. uv run finetune.py            # Phase 1: LoRA SFT on train split")
-    print("  2. uv run eval_harness.py ...     # Gate check on instruct benchmarks")
-    print("  3. uv run score.py --adapter-path runs/smoltalk_v1/adapter  # Attribution")
+    print(f"  1. uv run finetune.py --train-data {run_dir}/data/train --val-data {run_dir}/data/val --output-dir {run_dir}/adapter")
+    print(f"  2. uv run rebuild_attr_query.py   # builds {run_dir}/data/attr_query from smol-magpie-ultra")
+    print(f"  3. uv run score.py --manifest {run_dir}/manifest.json --adapter-path {run_dir}/adapter")
 
 
 if __name__ == "__main__":

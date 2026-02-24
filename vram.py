@@ -10,23 +10,15 @@ Usage:
 """
 from __future__ import annotations
 
-import os
-from pathlib import Path
-
 import torch
 
-os.environ.setdefault("HF_HOME", "/workspace/.hf_home")
+from pipeline_common import (
+    ATTN_IMPLEMENTATION,
+    DEFAULT_BASE_MODEL,
+    ensure_hf_home_env,
+)
 
-
-def resolve_model_path(model_id: str) -> str:
-    hf_home = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface"))
-    slug = "models--" + model_id.replace("/", "--")
-    snapshots_dir = hf_home / "hub" / slug / "snapshots"
-    if snapshots_dir.exists():
-        snapshots = sorted(snapshots_dir.iterdir())
-        if snapshots:
-            return str(snapshots[-1])
-    return model_id
+ensure_hf_home_env()
 
 
 def gb(n_bytes: int) -> str:
@@ -48,7 +40,7 @@ def report(label: str, before: int) -> None:
     print(f"  {label:<45} {gb(used):>9}  (total avail: {gb(total)})")
 
 
-BASE_MODEL = "HuggingFaceTB/SmolLM2-1.7B"
+BASE_MODEL = DEFAULT_BASE_MODEL
 SEQ_LEN = 2048
 DEVICE = "cuda"
 
@@ -61,10 +53,10 @@ def main() -> None:
     props = torch.cuda.get_device_properties(0)
     print(f"GPU: {props.name}  |  Total VRAM: {gb(props.total_memory)}\n")
 
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoModelForCausalLM
     from peft import LoraConfig, get_peft_model
 
-    model_path = resolve_model_path(BASE_MODEL)
+    model_path = BASE_MODEL
     print(f"Model path: {model_path}\n")
 
     # -----------------------------------------------------------------------
@@ -75,7 +67,7 @@ def main() -> None:
     before = peak()
     model = AutoModelForCausalLM.from_pretrained(
         model_path, torch_dtype=torch.bfloat16, device_map=DEVICE,
-        attn_implementation="sdpa",
+        attn_implementation=ATTN_IMPLEMENTATION,
     )
     model.eval()
     model.config.use_cache = False

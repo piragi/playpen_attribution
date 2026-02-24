@@ -1,7 +1,7 @@
 """LoRA SFT on pre-tokenized SmolTalk data.
 
 Loads output of build_sft_data.py (input_ids + labels columns), fine-tunes
-a Gemma base model with LoRA adapters using HF Trainer.
+the SmolLM2 base model with LoRA adapters using HF Trainer.
 
 Data must already be tokenized with prompt tokens masked (labels = -100).
 This keeps training and attribution in sync — Bergson sees the same masking.
@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 from pathlib import Path
 
 import torch
@@ -26,23 +25,21 @@ from datasets import load_from_disk
 from peft import LoraConfig, PeftConfig, PeftModel, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer, DataCollatorForSeq2Seq, Trainer, TrainingArguments
 
-def resolve_model_path(model_id: str) -> str:
-    """Return local snapshot path if cached, otherwise return model_id for hub download."""
-    hf_home = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface"))
-    slug = "models--" + model_id.replace("/", "--")
-    snapshots_dir = hf_home / "hub" / slug / "snapshots"
-    if snapshots_dir.exists():
-        snapshots = sorted(snapshots_dir.iterdir())
-        if snapshots:
-            return str(snapshots[-1])
-    return model_id
+from pipeline_common import (
+    ATTN_IMPLEMENTATION,
+    DEFAULT_BASE_MODEL,
+    ensure_hf_home_env,
+    infer_instruct_tokenizer_model,
+)
+
+ensure_hf_home_env()
 
 
 CONFIG = {
-    "base_model": "HuggingFaceTB/SmolLM2-1.7B",
-    "train_data": "runs/smoltalk_v1/data/train",
-    "val_data": "runs/smoltalk_v1/data/val",
-    "output_dir": "runs/smoltalk_v1/adapter",
+    "base_model": DEFAULT_BASE_MODEL,
+    "train_data": "runs/smoltalk_v4/data/train",
+    "val_data": "runs/smoltalk_v4/data/val",
+    "output_dir": "runs/smoltalk_v4/adapter",
     # Training
     "num_train_epochs": 2,
     "learning_rate": 3e-4,
@@ -80,8 +77,8 @@ def run_train(args: argparse.Namespace) -> None:
     train_ds = train_ds.select_columns(keep)
 
     print(f"train rows: {len(train_ds):,}")
-    # Val data is not used for in-training eval: Gemma 3's 262k vocab causes OOM
-    # when casting logits to float32 during eval. Use eval_harness.py post-training.
+    # In-training eval is disabled to avoid large logits-memory spikes.
+    # Use eval_harness.py post-training for benchmark checks.
     if val_ds is not None:
         print(f"val rows:   {len(val_ds):,} (not used for in-training eval)")
 
@@ -89,9 +86,9 @@ def run_train(args: argparse.Namespace) -> None:
     dtype = torch.bfloat16 if use_bf16 else torch.float32
 
     base = AutoModelForCausalLM.from_pretrained(
-        resolve_model_path(args.base_model),
+        args.base_model,
         torch_dtype=dtype,
-        attn_implementation="sdpa",
+        attn_implementation=ATTN_IMPLEMENTATION,
     )
     base.config.use_cache = False
 
@@ -116,10 +113,8 @@ def run_train(args: argparse.Namespace) -> None:
 
     # Always use the IT tokenizer for its chat template.
     # If resuming from an adapter that already has the IT tokenizer saved, load from there.
-    # Otherwise derive IT model name from base: strip -pt suffix, append -it.
-    # e.g. google/gemma-3-1b-pt → google/gemma-3-1b-it
-    #      google/gemma-3-270m   → google/gemma-3-270m-it
-    it_model = (args.base_model[:-3] + "-it") if args.base_model.endswith("-pt") else (args.base_model + "-Instruct")
+    # Otherwise derive IT tokenizer model name from base model.
+    it_model = infer_instruct_tokenizer_model(args.base_model)
     it_tokenizer_source = tokenizer_source if args.resume_adapter else it_model
     tokenizer = AutoTokenizer.from_pretrained(it_tokenizer_source)
     if tokenizer.pad_token is None:
@@ -198,7 +193,7 @@ def run_merge(args: argparse.Namespace) -> None:
     dtype = torch.bfloat16 if use_bf16 else torch.float32
 
     base = AutoModelForCausalLM.from_pretrained(
-        resolve_model_path(base_model), torch_dtype=dtype, attn_implementation="sdpa"
+        base_model, torch_dtype=dtype, attn_implementation=ATTN_IMPLEMENTATION
     )
     merged = PeftModel.from_pretrained(base, args.adapter_path).merge_and_unload()
     merged.save_pretrained(out_dir)

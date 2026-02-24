@@ -9,8 +9,10 @@ Run this when you want to change the attribution query without rebuilding everyt
 
 Then rerun score.py with the updated attr_query:
 
-    uv run score.py --adapter-path runs/smoltalk_v1/adapter \
-        --output-dir runs/smoltalk_v1/scores
+    uv run score.py --manifest <run_dir>/manifest.json \
+        --adapter-path <run_dir>/adapter \
+        --query-split attr_query \
+        --output-dir <run_dir>/scores_math_da
 """
 from __future__ import annotations
 
@@ -23,6 +25,9 @@ from datasets import Dataset, load_dataset
 from transformers import AutoTokenizer
 
 from build_sft_data import _get_magpie_score, _mask_prompt
+from pipeline_common import DEFAULT_BASE_MODEL, ensure_hf_home_env, infer_instruct_tokenizer_model
+
+ensure_hf_home_env()
 
 CONFIG = {
     "manifest_path": "runs/smoltalk_v4/manifest.json",
@@ -63,9 +68,9 @@ def main() -> None:
     max_length = manifest["max_length"]
 
     tokenizer_model = manifest.get("tokenizer_model")  # None if not in manifest
-    base_model = manifest.get("base_model", "google/gemma-3-1b-pt")
+    base_model = manifest.get("base_model", DEFAULT_BASE_MODEL)
     if not tokenizer_model or tokenizer_model == base_model:
-        tokenizer_model = (base_model[:-3] + "-it") if base_model.endswith("-pt") else (base_model + "-Instruct")
+        tokenizer_model = infer_instruct_tokenizer_model(base_model)
 
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_model)
     if tokenizer.pad_token is None:
