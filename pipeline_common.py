@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
 
 import torch
 
@@ -75,3 +75,27 @@ def pool_hidden_at_positions(hidden: torch.Tensor, positions: torch.Tensor) -> t
     idx = positions.to(hidden.device).unsqueeze(-1).unsqueeze(-1)
     idx = idx.expand(-1, 1, hidden.shape[-1])
     return hidden.gather(dim=1, index=idx).squeeze(1)
+
+
+def get_transformer_layers_for_hook(model: Any) -> Any:
+    """Return the transformer layers container for base or PEFT-wrapped CausalLMs."""
+    candidate_paths = [
+        ("model", "layers"),
+        ("base_model", "model", "model", "layers"),
+        ("base_model", "model", "layers"),
+        ("base_model", "layers"),
+    ]
+    for path in candidate_paths:
+        cur = model
+        ok = True
+        for attr in path:
+            if not hasattr(cur, attr):
+                ok = False
+                break
+            cur = getattr(cur, attr)
+        if ok:
+            return cur
+    raise AttributeError(
+        "Could not locate transformer layers on model for hook registration. "
+        "Expected one of: model.layers / base_model.model.model.layers / base_model.model.layers."
+    )

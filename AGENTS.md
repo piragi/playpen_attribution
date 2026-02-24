@@ -102,7 +102,7 @@ Interpretation: treat v4 as a strong signal worth pursuing. The pipeline now emi
 | `finetune.py` | LoRA SFT on pre-tokenized data; saves IT tokenizer alongside adapter. |
 | `score.py` | Bergson gradient-based attribution; pool vs attr_query; supports PEFT adapters. Pool is the training data. |
 | `probe.py` | Extract layer-17 residual stream from pool → fit Ridge probe to attribution scores. Caches embeddings to avoid re-extraction. |
-| `generate_continued_dataset.py` | Score new smol-magpie-ultra rows with probe → quality reference (top-N), optional scaled quality subsets, and two fixed-size random baselines (token-matched, token+category-matched). |
+| `generate_continued_dataset.py` | Score new smol-magpie-ultra rows with probe → quality reference (top-N), optional scaled quality subsets, two fixed-size random baselines (token-matched, token+category-matched), and optional label-only baselines from SmolTalk quality labels. |
 | `eval_harness.py` | lm-eval benchmark evaluation (ARC, HellaSwag, WinoGrande, IFEval, GSM8K). |
 | `vram.py` | VRAM profiler for SmolLM2-1.7B. |
 
@@ -189,6 +189,11 @@ IT model naming convention for SmolLM2: base = `SmolLM2-1.7B` → instruct = `Sm
 
 Scripts now pass model IDs directly to `from_pretrained(...)` and rely on the Hugging Face cache machinery. `HF_HOME` is set once (if not already set) to a standard local cache path.
 
+### Probe/continuation embedding source must match
+
+`probe.py` now supports `embedding_source_mode={"base","adapter"}` and writes the resolved source into `probe_meta_<name>.json`.
+`generate_continued_dataset.py` defaults to `embedding_source_mode="probe_meta"` so continuation scoring uses the same representation source as probe training. If these diverge, probe rankings can degrade due to representation mismatch.
+
 ### Attention implementation
 
 All scripts use `attn_implementation="sdpa"`. Do not use `"flash_attention_2"` (not installed) or `"eager"` (slow).
@@ -244,6 +249,7 @@ uv run eval_harness.py \
 | `pooling` | Last response token | Captures final response representation |
 | `ridge_alpha` | 100.0 | Avoids ill-conditioning of 2048-dim features |
 | `val_frac` | 0.20 | Standard held-out fraction |
+| `embedding_source_mode` | `base` (or `adapter`) | Ablation switch: extract probe embeddings from base or LoRA-adapted model |
 
 ### generate_continued_dataset.py
 
@@ -254,6 +260,8 @@ uv run eval_harness.py \
 | `quality_size` | 10,000 |
 | `quality_scales` | `[1.0, 0.8, 0.5]` |
 | `random_size` | 10,000 |
+| `label_arms` | `[{"name": "label_good_excellent", "qualities": {"good","excellent"}, "size": null, "token_match_probe": null}]` | Ranks label candidates (`excellent > good`, then Magpie score), keeps up to requested size, and if fewer exist keeps all available (shortfall logged). |
+| `embedding_source_mode` | `probe_meta` | Reuse the same embedding source recorded by probe metadata for representation consistency |
 
 ---
 
@@ -270,7 +278,7 @@ runs/smoltalk_v4/
   scores_math_da/
     row_diagnostics.jsonl       ← per-train-row Bergson scores against math+DA query
   probe/
-    pool_embeddings.npy         ← (5000, 2048) layer-17 residual stream for train
+    pool_embeddings_<hash>.npy  ← (5000, 2048) layer-17 residual stream for train
     probe_math_da.pkl           ← Ridge probe (val R²=0.71, Pearson r=0.85)
     probe_meta_math_da.json
   continuation/
@@ -279,6 +287,7 @@ runs/smoltalk_v4/
     quality_math_da_50pct/     5k rows — top-50% of quality reference
     random_token_match/      10k rows — token-budget matched random baseline
     random_token_cat_match/  10k rows — token+category matched random baseline
+    label_good_excellent/    10k rows — label-only baseline (SmolTalk quality in {good, excellent})
   adapter_quality_math_da/
   adapter_quality_math_da_80pct/
   adapter_quality_math_da_50pct/
@@ -302,7 +311,7 @@ runs/smoltalk_v4/
 
 3. **Probe R² ceiling**: R²=0.71 with 5k training examples. Does it improve with more training data? The pool is fundamentally limited to the train split size. Also what is the min/max of data needed here?
 
-4. **Quality label ablation**: Can a binary probe (good/excellent vs poor) trained without any attribution match the performance of the attribution probe? If yes, Bergson is unnecessary and quality labels alone suffice.
+4. **Quality label ablation**: `generate_continued_dataset.py` now supports a label-only arm (`label_good_excellent`) from SmolTalk judge labels. Open question: does this arm match or beat probe-selected quality on GSM8K and overall average?
 
 5. **Selection rate sensitivity**: Quality arm = top-10k of 30k (33%). What happens at top-5k (17%) — does tighter selection improve GSM8K further or hurt coverage?
 

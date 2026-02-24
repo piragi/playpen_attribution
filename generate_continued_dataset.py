@@ -1,12 +1,13 @@
-"""Score new SmolTalk examples with the residual stream probe and produce quality + random baselines.
+"""Score new SmolTalk examples with the residual stream probe and produce ablation arms.
 
 Streams the next unselected block of SmolTalk (past the rows consumed by build_sft_data.py),
 runs each example through the base model, extracts the layer-17 residual stream, and scores
-it with the probe trained in probe.py. Produces one quality arm plus two random baselines:
+it with the probe trained in probe.py. Produces:
 
   continuation/quality_<probe>/                  — top-N by probe score
   continuation/random_token_match(_<probe>)/     — random rows with matched token budget
   continuation/random_token_cat_match(_<probe>)/ — random rows with matched token budget and category mix
+  continuation/label_*                           — optional LLM-judge label-only baseline(s)
 
 Both are ready for finetune.py (input_ids + labels + length columns).
 
@@ -26,12 +27,14 @@ from typing import Any
 import numpy as np
 import torch
 from datasets import Dataset, load_dataset
+from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from build_sft_data import _get_magpie_score, _mask_prompt
 from pipeline_common import (
     ATTN_IMPLEMENTATION,
     ensure_hf_home_env,
+    get_transformer_layers_for_hook,
     infer_instruct_tokenizer_model,
     last_response_token_positions,
     pad_tokenized_batch,
@@ -56,9 +59,27 @@ CONFIG = {
     "quality_size": 10_000,    # top-N by each probe score → reference quality arm per probe
     "quality_scales": [1.0, 0.8, 0.5],  # emit additional quality arms as fractions of quality_size
     "random_size": 10_000,     # rows in each random baseline arm
+    # Optional label-only baseline arms (LLM-judge quality field from SmolTalk rows).
+    # Each arm ranks rows whose `quality` is in `qualities` and keeps the best ones.
+    # `size=None` defaults to quality_size; token budget is matched to `token_match_probe`
+    # (or first probe when token_match_probe=None).
+    "label_arms": [
+        {
+            "name": "label_good_excellent",
+            "qualities": {"good", "excellent"},
+            "size": None,
+            "token_match_probe": None,
+        },
+    ],
     "batch_size": 64,
     "seed": 42,
     "device": "auto",
+    # Embedding source for residual extraction:
+    # - "probe_meta": auto-use source recorded in probe_meta_<name>.json (recommended)
+    # - "base": always use manifest base_model
+    # - "adapter": use manifest base_model + embedding_adapter_path
+    "embedding_source_mode": "probe_meta",
+    "embedding_adapter_path": None,
 }
 
 
@@ -160,6 +181,64 @@ def _quality_arm_name(probe_name: str, scale: float) -> str:
     return f"quality_{probe_name}" if pct == 100 else f"quality_{probe_name}_{pct}pct"
 
 
+def resolve_embedding_source(cfg: dict, base_model: str, probe_specs: list[dict[str, str]]) -> dict[str, Any]:
+    """Resolve embedding model source for continuation scoring."""
+    mode = str(cfg.get("embedding_source_mode", "probe_meta")).strip().lower()
+    if mode not in {"probe_meta", "base", "adapter"}:
+        raise ValueError(
+            f"Invalid embedding_source_mode '{mode}'. "
+            "Expected one of: probe_meta, base, adapter."
+        )
+
+    if mode == "base":
+        return {"mode": "base", "base_model": base_model, "adapter_path": None}
+
+    if mode == "adapter":
+        adapter_path = cfg.get("embedding_adapter_path")
+        if not adapter_path:
+            raise ValueError("embedding_source_mode='adapter' requires embedding_adapter_path.")
+        return {
+            "mode": "adapter",
+            "base_model": base_model,
+            "adapter_path": str(Path(adapter_path)),
+        }
+
+    # mode == probe_meta
+    sources: list[tuple[str, str | None, str, int | None]] = []
+    for spec in probe_specs:
+        meta_path = Path(cfg["probe_dir"]) / f"probe_meta_{spec['name']}.json"
+        if not meta_path.exists():
+            continue
+        meta = json.loads(meta_path.read_text())
+        source = meta.get("embedding_source")
+        if not source:
+            continue
+        src_mode = str(source.get("mode", "base")).strip().lower()
+        src_adapter = source.get("adapter_path")
+        src_layer = meta.get("extraction_layer")
+        sources.append((src_mode, str(src_adapter) if src_adapter else None, str(meta_path), src_layer))
+
+    if not sources:
+        print("WARNING: probe meta has no embedding_source info; defaulting to base embeddings.")
+        return {"mode": "base", "base_model": base_model, "adapter_path": None}
+
+    first_mode, first_adapter, first_meta, first_layer = sources[0]
+    for src_mode, src_adapter, meta_path, src_layer in sources[1:]:
+        if src_mode != first_mode or src_adapter != first_adapter or src_layer != first_layer:
+            raise ValueError(
+                "Probe metas disagree on embedding source:\n"
+                f"  first: mode={first_mode} adapter={first_adapter} layer={first_layer} ({first_meta})\n"
+                f"  other: mode={src_mode} adapter={src_adapter} layer={src_layer} ({meta_path})"
+            )
+    return {
+        "mode": first_mode,
+        "base_model": base_model,
+        "adapter_path": first_adapter,
+        "probe_extraction_layer": first_layer,
+        "from_probe_meta": True,
+    }
+
+
 def _sample_random_with_token_target(
     candidate_idx: list[int],
     lengths: np.ndarray,
@@ -169,6 +248,7 @@ def _sample_random_with_token_target(
     n_select: int,
     categories: list[str] | None = None,
     target_group_counts: dict[str, int] | None = None,
+    initial_selected_idx: list[int] | None = None,
 ) -> tuple[list[int], dict[str, Any]]:
     candidates = np.array(candidate_idx, dtype=np.int32)
     if len(candidates) < n_select:
@@ -184,8 +264,6 @@ def _sample_random_with_token_target(
             raise ValueError("categories are required when target_group_counts is set.")
 
     group_pools: dict[str, np.ndarray] = {}
-    group_selected: dict[str, np.ndarray] = {}
-    group_unselected: dict[str, np.ndarray] = {}
     for group, need in group_counts.items():
         pool = (
             candidates
@@ -196,12 +274,48 @@ def _sample_random_with_token_target(
             raise ValueError(
                 f"Cannot sample group '{group}': need {need}, only {len(pool)} candidates available."
             )
-        pick_pos = rng.choice(len(pool), size=need, replace=False)
-        mask = np.ones(len(pool), dtype=bool)
-        mask[pick_pos] = False
         group_pools[group] = pool
-        group_selected[group] = pool[pick_pos].astype(np.int32)
-        group_unselected[group] = pool[mask].astype(np.int32)
+
+    group_selected: dict[str, np.ndarray] = {}
+    group_unselected: dict[str, np.ndarray] = {}
+    if initial_selected_idx is None:
+        for group, need in group_counts.items():
+            pool = group_pools[group]
+            pick_pos = rng.choice(len(pool), size=need, replace=False)
+            mask = np.ones(len(pool), dtype=bool)
+            mask[pick_pos] = False
+            group_selected[group] = pool[pick_pos].astype(np.int32)
+            group_unselected[group] = pool[mask].astype(np.int32)
+    else:
+        initial = np.array([int(i) for i in initial_selected_idx], dtype=np.int32)
+        if len(initial) != n_select:
+            raise ValueError(
+                "initial_selected_idx must have exactly n_select rows: "
+                f"got {len(initial)} vs expected {n_select}."
+            )
+        if len(set(initial.tolist())) != n_select:
+            raise ValueError("initial_selected_idx must not contain duplicates.")
+        candidate_set = set(int(i) for i in candidates.tolist())
+        if any(int(i) not in candidate_set for i in initial.tolist()):
+            raise ValueError("initial_selected_idx contains rows not present in candidate_idx.")
+
+        selected_set = set(int(i) for i in initial.tolist())
+        for group, need in group_counts.items():
+            if group == "__all__":
+                sel = np.array(sorted(selected_set), dtype=np.int32)
+            else:
+                sel = np.array(
+                    sorted(i for i in selected_set if categories[int(i)] == group),
+                    dtype=np.int32,
+                )
+            if len(sel) != need:
+                raise ValueError(
+                    f"initial_selected_idx has {len(sel)} rows for group '{group}', expected {need}."
+                )
+            pool = group_pools[group]
+            unselected = np.array([int(i) for i in pool.tolist() if int(i) not in selected_set], dtype=np.int32)
+            group_selected[group] = sel
+            group_unselected[group] = unselected
 
     selected = np.concatenate(list(group_selected.values())).astype(np.int32)
     tokens_before = _subset_token_sum(selected, lengths)
@@ -289,6 +403,21 @@ def main() -> None:
         with probe_path.open("rb") as f:
             probes.append({"name": spec["name"], "probe": pickle.load(f)})
     print(f"Loaded {len(probes)} probes: {[p['name'] for p in probes]}")
+    embedding_source = resolve_embedding_source(cfg, base_model, probe_specs)
+    probe_layer = embedding_source.get("probe_extraction_layer")
+    if embedding_source.get("from_probe_meta") and probe_layer is not None:
+        cfg_layer = int(cfg["extraction_layer"])
+        if int(probe_layer) != cfg_layer:
+            raise ValueError(
+                "Probe meta extraction layer mismatch: "
+                f"probe_meta={probe_layer} vs generate_continued_dataset.py config={cfg_layer}. "
+                "Set CONFIG['extraction_layer'] to match probe.py or regenerate the probe."
+            )
+    print(
+        "Embedding source for continuation scoring: "
+        f"{embedding_source['mode']}"
+        + (f" ({embedding_source['adapter_path']})" if embedding_source.get("adapter_path") else "")
+    )
 
     # --- IT tokenizer ---
     it_model = infer_instruct_tokenizer_model(base_model)
@@ -296,20 +425,29 @@ def main() -> None:
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # --- Base model + hook ---
-    model_path = base_model
-    print(f"\nLoading {base_model} (path: {model_path}) ...")
+    # --- Embedding model + hook ---
+    print(f"\nLoading base model for embedding extraction: {base_model} ...")
     captured: dict[str, torch.Tensor] = {}
 
     def hook_fn(_module: Any, _input: Any, output: Any) -> None:
         captured["acts"] = output[0] if isinstance(output, tuple) else output
 
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path, torch_dtype=dtype, device_map=device, attn_implementation=ATTN_IMPLEMENTATION
+    base = AutoModelForCausalLM.from_pretrained(
+        base_model, torch_dtype=dtype, device_map=device, attn_implementation=ATTN_IMPLEMENTATION
     )
+    if embedding_source["mode"] == "adapter":
+        model = PeftModel.from_pretrained(
+            base,
+            embedding_source["adapter_path"],
+            is_trainable=False,
+            autocast_adapter_dtype=False,
+        )
+    else:
+        model = base
     model.eval()
     model.config.use_cache = False
-    model.model.layers[cfg["extraction_layer"]].register_forward_hook(hook_fn)
+    layers = get_transformer_layers_for_hook(model)
+    layers[cfg["extraction_layer"]].register_forward_hook(hook_fn)
     print(f"Hook at layer {cfg['extraction_layer']}")
 
     # --- Stream and score ---
@@ -391,14 +529,16 @@ def main() -> None:
     quality_idx_by_arm: dict[str, list[int]] = {}
     quality_arm_meta: dict[str, dict[str, Any]] = {}
     quality_arm_order: list[str] = []
-    base_quality_idx_per_probe: list[list[int]] = []
+    base_quality_idx_by_probe: dict[str, list[int]] = {}
+    quality_ref_tokens_by_probe: dict[str, int] = {}
     for j, p in enumerate(probes):
         col = scores_matrix[:, j]
         ranked_idx = np.argsort(col)[::-1]
         base_idx = ranked_idx[:quality_size].astype(np.int32)
         if len(base_idx) == 0:
             raise ValueError("quality_size produced an empty quality arm.")
-        base_quality_idx_per_probe.append([int(i) for i in base_idx.tolist()])
+        base_quality_idx_by_probe[p["name"]] = [int(i) for i in base_idx.tolist()]
+        quality_ref_tokens_by_probe[p["name"]] = int(all_lengths[base_idx].sum())
 
         threshold = float(col[int(base_idx[-1])])
         print(
@@ -434,10 +574,10 @@ def main() -> None:
     random_arm_order: list[str] = []
     for j, p in enumerate(probes):
         quality_name = _quality_arm_name(p["name"], 1.0)
-        quality_idx = base_quality_idx_per_probe[j]
+        quality_idx = base_quality_idx_by_probe[p["name"]]
         quality_set = set(quality_idx)
         candidates = [i for i in range(n_pool) if i not in quality_set]
-        target_tokens = int(all_lengths[np.array(quality_idx, dtype=np.int32)].sum())
+        target_tokens = quality_ref_tokens_by_probe[p["name"]]
 
         # Use separate deterministic RNG streams per arm to avoid accidental coupling.
         base_seed = int(cfg["seed"]) + (j * 1000)
@@ -496,7 +636,130 @@ def main() -> None:
             print(
                 f"    WARNING: {cat_arm} could not reach target tokens under category constraints "
                 f"(max={cat_meta['max_possible_tokens']:,})."
+                )
+
+    # Optional label-only baselines from SmolTalk LLM-judge quality labels.
+    label_idx_by_arm: dict[str, list[int]] = {}
+    label_meta_by_arm: dict[str, dict[str, Any]] = {}
+    label_arm_order: list[str] = []
+    label_specs = list(cfg.get("label_arms") or [])
+    if label_specs:
+        default_probe_name = probes[0]["name"]
+        row_quality = [str(r.get("quality", "")).strip().lower() for r in pool_rows]
+        row_magpie = np.array([float(r.get("magpie_score", 0.0)) for r in pool_rows], dtype=np.float32)
+        quality_rank = {"excellent": 3, "good": 2, "fair": 1, "poor": 0}
+        for arm_i, spec in enumerate(label_specs):
+            arm_name = str(spec.get("name", "")).strip()
+            if not arm_name:
+                raise ValueError("Each entry in CONFIG['label_arms'] needs a non-empty 'name'.")
+            if arm_name in quality_idx_by_arm or arm_name in random_idx_by_arm:
+                raise ValueError(f"Label arm name collides with existing arm: {arm_name}")
+
+            qualities = {str(q).strip().lower() for q in (spec.get("qualities") or []) if str(q).strip()}
+            if not qualities:
+                raise ValueError(f"Label arm '{arm_name}' has empty qualities; provide at least one label value.")
+
+            requested_rows = quality_size if spec.get("size") is None else int(spec["size"])
+            if requested_rows <= 0:
+                raise ValueError(f"Label arm '{arm_name}' has non-positive size: {requested_rows}.")
+
+            candidates = [i for i, q in enumerate(row_quality) if q in qualities]
+            available_rows = len(candidates)
+            if available_rows == 0:
+                print(
+                    f"    WARNING: label arm '{arm_name}' has zero candidates for "
+                    f"qualities={sorted(qualities)}; skipping this arm."
+                )
+                continue
+            selected_rows = min(requested_rows, available_rows)
+            shortfall_rows = max(0, requested_rows - available_rows)
+
+            # Deterministic "best available" ranking:
+            # 1) quality label rank (excellent > good > fair > poor)
+            # 2) magpie_score
+            # 3) length
+            ranked_candidates = sorted(
+                candidates,
+                key=lambda i: (
+                    quality_rank.get(row_quality[i], -1),
+                    float(row_magpie[i]),
+                    int(all_lengths[i]),
+                    -int(i),
+                ),
+                reverse=True,
             )
+            base_selected = ranked_candidates[:selected_rows]
+
+            match_probe = spec.get("token_match_probe")
+            if match_probe is None:
+                match_probe = default_probe_name
+            if match_probe:
+                match_probe = str(match_probe)
+                if match_probe not in quality_ref_tokens_by_probe:
+                    known = ", ".join(sorted(quality_ref_tokens_by_probe))
+                    raise ValueError(
+                        f"Label arm '{arm_name}' references unknown token_match_probe '{match_probe}'. "
+                        f"Known probes: {known}"
+                    )
+                target_tokens = int(quality_ref_tokens_by_probe[match_probe])
+            else:
+                target_tokens = None
+
+            if target_tokens is None:
+                label_idx = sorted(int(i) for i in base_selected)
+                selected_tokens = _subset_token_sum(np.array(label_idx, dtype=np.int32), all_lengths)
+                label_meta: dict[str, Any] = {
+                    "selection_method": "label_top_ranked",
+                    "qualities": sorted(qualities),
+                    "requested_rows": int(requested_rows),
+                    "available_rows": int(available_rows),
+                    "rows": int(selected_rows),
+                    "shortfall_rows": int(shortfall_rows),
+                    "selected_tokens": int(selected_tokens),
+                    "token_match_probe": None,
+                }
+            else:
+                # Preserve the top-ranked label mix, then apply minimal swaps within each label bucket
+                # to better match token budget.
+                target_quality_counts = Counter(row_quality[i] for i in base_selected)
+                label_idx, label_meta = _sample_random_with_token_target(
+                    candidate_idx=candidates,
+                    lengths=all_lengths,
+                    target_tokens=target_tokens,
+                    rng=np.random.default_rng(int(cfg["seed"]) + 10_000 + arm_i),
+                    n_select=selected_rows,
+                    categories=row_quality,
+                    target_group_counts={k: int(v) for k, v in target_quality_counts.items()},
+                    initial_selected_idx=[int(i) for i in base_selected],
+                )
+                label_meta = dict(label_meta)
+                label_meta["selection_method"] = "label_top_ranked_plus_simple_swaps"
+                label_meta["qualities"] = sorted(qualities)
+                label_meta["requested_rows"] = int(requested_rows)
+                label_meta["available_rows"] = int(available_rows)
+                label_meta["rows"] = int(selected_rows)
+                label_meta["shortfall_rows"] = int(shortfall_rows)
+                label_meta["token_match_probe"] = match_probe
+
+            label_idx_by_arm[arm_name] = label_idx
+            label_meta_by_arm[arm_name] = label_meta
+            label_arm_order.append(arm_name)
+            print(
+                f"  Label arm [{arm_name}]: {len(label_idx):,} rows, "
+                f"qualities={sorted(qualities)}, requested={requested_rows:,}, "
+                f"available={available_rows:,}, selected={selected_rows:,}, "
+                f"tokens={label_meta['selected_tokens']:,}"
+                + (
+                    f", target={label_meta['target_tokens']:,}, delta={int(label_meta['token_delta']):+,}"
+                    if "target_tokens" in label_meta
+                    else ""
+                )
+            )
+            if shortfall_rows > 0:
+                print(
+                    f"    WARNING: label arm '{arm_name}' shortfall: "
+                    f"requested={requested_rows:,}, available={available_rows:,}, selected={selected_rows:,}."
+                )
 
     # --- Save ---
     out_dir = Path(cfg["output_dir"])
@@ -529,6 +792,12 @@ def main() -> None:
         arm_info = save_arm(arm_rows, arm_name)
         arm_info["match"] = random_match_meta[arm_name]
         arms_info[arm_name] = arm_info
+    for arm_name in label_arm_order:
+        idxs = label_idx_by_arm[arm_name]
+        arm_rows = [pool_rows[i] for i in idxs]
+        arm_info = save_arm(arm_rows, arm_name)
+        arm_info["selection"] = label_meta_by_arm[arm_name]
+        arms_info[arm_name] = arm_info
 
     cont_manifest = {
         "base_model": base_model,
@@ -545,6 +814,16 @@ def main() -> None:
         "quality_size": quality_size,
         "quality_scales": quality_scales,
         "random_size": random_size,
+        "label_arms": [
+            {
+                "name": str(spec.get("name", "")),
+                "qualities": sorted(str(q).strip().lower() for q in (spec.get("qualities") or []) if str(q).strip()),
+                "size": (quality_size if spec.get("size") is None else int(spec["size"])),
+                "token_match_probe": spec.get("token_match_probe"),
+            }
+            for spec in label_specs
+        ],
+        "embedding_source": embedding_source,
         "category_filter": sorted(category_filter) if category_filter else None,
         "arms": arms_info,
     }
@@ -555,7 +834,7 @@ def main() -> None:
     run_dir = str(Path(cfg["manifest_path"]).parent)
     val_data = manifest["splits"]["val"]["path"]
     print("\nNext steps:")
-    for arm_name in list(quality_arm_order) + list(random_arm_order):
+    for arm_name in list(quality_arm_order) + list(random_arm_order) + list(label_arm_order):
         print(f"  uv run finetune.py --base-model {base_model} "
               f"--train-data {arms_info[arm_name]['path']} "
               f"--val-data {val_data} "

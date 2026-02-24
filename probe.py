@@ -16,13 +16,16 @@ Run AFTER score.py:
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import pickle
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
 from datasets import load_from_disk
+from peft import PeftModel
 from scipy.stats import pearsonr
 from sklearn.linear_model import Ridge
 from sklearn.model_selection import train_test_split
@@ -31,6 +34,7 @@ from transformers import AutoModelForCausalLM
 from pipeline_common import (
     ATTN_IMPLEMENTATION,
     ensure_hf_home_env,
+    get_transformer_layers_for_hook,
     last_response_token_positions,
     pad_tokenized_batch,
     pool_hidden_at_positions,
@@ -59,7 +63,37 @@ CONFIG = {
     "seed": 42,
     "batch_size": 64,
     "device": "auto",
+    # Embedding source model for residual extraction:
+    # - "base": use manifest base_model (default)
+    # - "adapter": load manifest base_model + this LoRA adapter
+    "embedding_source_mode": "base",
+    "embedding_adapter_path": None,
 }
+
+
+def resolve_embedding_source(cfg: dict, base_model: str) -> dict[str, Any]:
+    """Resolve embedding source config into a normalized descriptor."""
+    mode = str(cfg.get("embedding_source_mode", "base")).strip().lower()
+    if mode not in {"base", "adapter"}:
+        raise ValueError(f"Invalid embedding_source_mode '{mode}'. Expected 'base' or 'adapter'.")
+
+    adapter_path = cfg.get("embedding_adapter_path")
+    if mode == "adapter":
+        if not adapter_path:
+            raise ValueError("embedding_source_mode='adapter' requires embedding_adapter_path.")
+        adapter_path = str(Path(adapter_path))
+    else:
+        adapter_path = None
+
+    source = {
+        "mode": mode,
+        "base_model": base_model,
+        "adapter_path": adapter_path,
+        "extraction_layer": int(cfg["extraction_layer"]),
+    }
+    fingerprint = hashlib.sha1(json.dumps(source, sort_keys=True).encode("utf-8")).hexdigest()[:10]
+    source["fingerprint"] = fingerprint
+    return source
 
 
 def extract_embeddings(
@@ -130,6 +164,8 @@ def fit_probe(
     out_dir: Path,
     scores_source: str,
     base_model: str,
+    embeddings_path: str,
+    embedding_source: dict[str, Any],
 ) -> None:
     """Fit and save one Ridge probe."""
     idx = np.arange(len(embeddings))
@@ -172,7 +208,8 @@ def fit_probe(
         "val_r2": r2,
         "val_pearson_r": float(r),
         "train_r2": r2_train,
-        "embeddings_path": str(out_dir / "pool_embeddings.npy"),
+        "embeddings_path": embeddings_path,
+        "embedding_source": embedding_source,
         "scores_source": scores_source,
     }
     (out_dir / f"probe_meta_{probe_name}.json").write_text(json.dumps(meta, indent=2))
@@ -188,6 +225,12 @@ def main() -> None:
 
     manifest = json.loads(Path(cfg["manifest_path"]).read_text())
     base_model = manifest["base_model"]
+    embedding_source = resolve_embedding_source(cfg, base_model)
+    print(
+        "Embedding source: "
+        f"{embedding_source['mode']}"
+        + (f" ({embedding_source['adapter_path']})" if embedding_source["adapter_path"] else "")
+    )
 
     pool_path = Path(manifest["splits"]["score_pool"]["path"])
     pool_ds = load_from_disk(str(pool_path))
@@ -197,27 +240,38 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # --- Extract embeddings once (reused for all probes) ---
-    emb_path = out_dir / "pool_embeddings.npy"
+    emb_path = out_dir / f"pool_embeddings_{embedding_source['fingerprint']}.npy"
+    emb_meta_path = out_dir / f"pool_embeddings_{embedding_source['fingerprint']}.json"
     if emb_path.exists():
         print(f"\nReusing cached embeddings from {emb_path}")
         embeddings = np.load(str(emb_path))
         print(f"Embeddings: {embeddings.shape}  (dtype={embeddings.dtype})")
     else:
-        print(f"\nLoading {base_model} ...")
+        print(f"\nLoading embedding model from {embedding_source['mode']} source ...")
         captured: dict[str, torch.Tensor] = {}
 
-        def hook_fn(_module, _input, output):
+        def hook_fn(_module: Any, _input: Any, output: Any):
             captured["acts"] = output[0] if isinstance(output, tuple) else output
 
-        model = AutoModelForCausalLM.from_pretrained(
+        base = AutoModelForCausalLM.from_pretrained(
             base_model,
             torch_dtype=dtype,
             device_map=device,
             attn_implementation=ATTN_IMPLEMENTATION,
         )
+        if embedding_source["mode"] == "adapter":
+            model = PeftModel.from_pretrained(
+                base,
+                embedding_source["adapter_path"],
+                is_trainable=False,
+                autocast_adapter_dtype=False,
+            )
+        else:
+            model = base
         model.eval()
         model.config.use_cache = False
-        model.model.layers[cfg["extraction_layer"]].register_forward_hook(hook_fn)
+        layers = get_transformer_layers_for_hook(model)
+        layers[cfg["extraction_layer"]].register_forward_hook(hook_fn)
         print(f"Hook registered at layer {cfg['extraction_layer']}")
 
         print(f"\nExtracting residual stream embeddings ...")
@@ -229,6 +283,12 @@ def main() -> None:
             torch.cuda.empty_cache()
 
         np.save(str(emb_path), embeddings)
+        emb_meta_path.write_text(json.dumps({
+            "embeddings_path": str(emb_path),
+            "embedding_source": embedding_source,
+            "shape": list(embeddings.shape),
+            "dtype": str(embeddings.dtype),
+        }, indent=2))
         print(f"Saved embeddings → {emb_path}")
 
     # --- Train probes ---
@@ -244,22 +304,50 @@ def main() -> None:
         )
         pos = int(scores_y.sum())
         print(f"Quality labels: {pos:,} positive, {len(scores_y)-pos:,} negative")
-        fit_probe(embeddings, scores_y, cfg, "quality_labels", out_dir, "quality_labels", base_model)
+        fit_probe(
+            embeddings,
+            scores_y,
+            cfg,
+            "quality_labels",
+            out_dir,
+            "quality_labels",
+            base_model,
+            str(emb_path),
+            embedding_source,
+        )
 
     elif probe_specs:
         for spec in probe_specs:
             name, scores_dir = spec["name"], spec["scores_dir"]
             scores_y = load_scores_from_dir(scores_dir, len(pool_ds))
             print(f"\nScores [{name}]: range [{scores_y.min():.4f}, {scores_y.max():.4f}]  mean={scores_y.mean():.4f}")
-            fit_probe(embeddings, scores_y, cfg, name, out_dir,
-                      str(Path(scores_dir) / "row_diagnostics.jsonl"), base_model)
+            fit_probe(
+                embeddings,
+                scores_y,
+                cfg,
+                name,
+                out_dir,
+                str(Path(scores_dir) / "row_diagnostics.jsonl"),
+                base_model,
+                str(emb_path),
+                embedding_source,
+            )
 
     else:
         scores_y = load_scores_from_dir(cfg["scores_dir"], len(pool_ds))
         print(f"Loaded {len(scores_y):,} attribution scores")
         print(f"  range [{scores_y.min():.4f}, {scores_y.max():.4f}]  mean={scores_y.mean():.4f}")
-        fit_probe(embeddings, scores_y, cfg, "probe", out_dir,
-                  str(Path(cfg["scores_dir"]) / "row_diagnostics.jsonl"), base_model)
+        fit_probe(
+            embeddings,
+            scores_y,
+            cfg,
+            "probe",
+            out_dir,
+            str(Path(cfg["scores_dir"]) / "row_diagnostics.jsonl"),
+            base_model,
+            str(emb_path),
+            embedding_source,
+        )
     print("\nNext: uv run generate_continued_dataset.py")
 
 
