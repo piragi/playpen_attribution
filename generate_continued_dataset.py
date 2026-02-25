@@ -18,11 +18,12 @@ from __future__ import annotations
 import gc
 import json
 import pickle
+import shutil
 from pathlib import Path
 
 import numpy as np
 import torch
-from datasets import Dataset, load_dataset
+from datasets import Dataset, load_dataset, load_from_disk
 from tqdm.auto import tqdm
 
 from pipeline_common import (
@@ -57,6 +58,56 @@ CONFIG = {
 
 
 # ── Core functions ────────────────────────────────────────────────────────────
+
+def _score_cache_signature(cfg: dict, manifest: dict, probe_paths: list[Path]) -> dict:
+    category_filter = cfg.get("category_filter")
+    category_vals = sorted(category_filter) if category_filter else None
+    probe_files = []
+    for p in probe_paths:
+        st = p.stat()
+        probe_files.append({"path": str(p), "size": st.st_size, "mtime_ns": st.st_mtime_ns})
+    return {
+        "dataset": manifest["dataset"],
+        "dataset_config": manifest["dataset_config"],
+        "raw_rows_consumed": manifest.get("raw_rows_consumed"),
+        "max_length": manifest["max_length"],
+        "base_model": manifest["base_model"],
+        "gen_adapter_path": cfg.get("gen_adapter_path"),
+        "extraction_layer": cfg.get("extraction_layer", 17),
+        "category_filter": category_vals,
+        "pool_size": cfg.get("pool_size"),
+        "probes": probe_files,
+    }
+
+
+def _load_score_cache(cache_dir: Path, signature: dict) -> tuple[list[dict], np.ndarray] | None:
+    meta_path = cache_dir / "score_cache_meta.json"
+    rows_path = cache_dir / "pool_rows"
+    scores_path = cache_dir / "scores.npy"
+    if not (meta_path.exists() and rows_path.exists() and scores_path.exists()):
+        return None
+    try:
+        cached_meta = json.loads(meta_path.read_text())
+        if cached_meta != signature:
+            return None
+        rows = load_from_disk(str(rows_path)).to_list()
+        scores = np.load(str(scores_path))
+        if len(rows) != len(scores):
+            return None
+        return rows, scores
+    except Exception as e:
+        print(f"WARNING: failed to load score cache ({e}); rescoring.")
+        return None
+
+
+def _save_score_cache(cache_dir: Path, signature: dict, rows: list[dict], scores: np.ndarray) -> None:
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    rows_path = cache_dir / "pool_rows"
+    if rows_path.exists():
+        shutil.rmtree(rows_path)
+    Dataset.from_list(rows).save_to_disk(str(rows_path))
+    np.save(str(cache_dir / "scores.npy"), scores.astype(np.float32))
+    (cache_dir / "score_cache_meta.json").write_text(json.dumps(signature, indent=2))
 
 def score_batch(batch_rows, probes, model, captured, device) -> np.ndarray:
     """Forward pass → probe scores for a batch of tokenized rows.
@@ -234,27 +285,49 @@ def run(cfg: dict) -> None:
     base_model = manifest["base_model"]
 
     probe_dir = run_dir / "probe"
-    probes = []
-    for spec in cfg["probes"]:
-        filename = spec.get("filename") or f"probe_{spec['name']}.pkl"
-        path = probe_dir / filename
-        with path.open("rb") as f:
-            probes.append({"name": spec["name"], "probe": pickle.load(f)})
-    print(f"Loaded probes: {[p['name'] for p in probes]}")
+    probe_specs = cfg["probes"]
+    probe_paths = [probe_dir / (s.get("filename") or f"probe_{s['name']}.pkl") for s in probe_specs]
+    probe_names = [s["name"] for s in probe_specs]
+    cache_dir = run_dir / "continuation" / "cache"
+    cache_sig = _score_cache_signature(cfg, manifest, probe_paths)
+    cached = _load_score_cache(cache_dir, cache_sig)
 
-    model, captured = load_model_with_hook(
-        base_model, cfg.get("gen_adapter_path"), cfg.get("extraction_layer", 17), dtype, device
-    )
+    if cached is not None:
+        pool_rows, scores_matrix = cached
+        print(f"Loaded score cache: {len(pool_rows):,} rows from {cache_dir}")
+    else:
+        probes = []
+        for spec in probe_specs:
+            filename = spec.get("filename") or f"probe_{spec['name']}.pkl"
+            path = probe_dir / filename
+            with path.open("rb") as f:
+                probes.append({"name": spec["name"], "probe": pickle.load(f)})
+        print(f"Loaded probes: {[p['name'] for p in probes]}")
 
-    # Override batch_size key for stream_and_score compatibility
-    stream_cfg = {**cfg, "batch_size": cfg.get("gen_batch_size", 64)}
-    pool_rows, scores_matrix = stream_and_score(stream_cfg, manifest, probes, model, captured, device)
+        model, captured = load_model_with_hook(
+            base_model, cfg.get("gen_adapter_path"), cfg.get("extraction_layer", 17), dtype, device
+        )
+
+        # Override batch_size key for stream_and_score compatibility
+        stream_cfg = {**cfg, "batch_size": cfg.get("gen_batch_size", 64)}
+        pool_rows, scores_matrix = stream_and_score(stream_cfg, manifest, probes, model, captured, device)
+
+        del model
+        gc.collect()
+        if device == "cuda":
+            torch.cuda.empty_cache()
+
+        _save_score_cache(cache_dir, cache_sig, pool_rows, scores_matrix)
+        print(f"Saved score cache: {len(pool_rows):,} rows to {cache_dir}")
+
     n_pool = len(pool_rows)
-
-    del model
-    gc.collect()
-    if device == "cuda":
-        torch.cuda.empty_cache()
+    if scores_matrix.ndim == 1:
+        scores_matrix = scores_matrix.reshape(-1, 1)
+    if scores_matrix.shape[1] != len(probe_names):
+        raise RuntimeError(
+            f"Probe/score shape mismatch: scores have {scores_matrix.shape[1]} columns, "
+            f"but config has {len(probe_names)} probes."
+        )
 
     out_dir = run_dir / "continuation"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -263,9 +336,8 @@ def run(cfg: dict) -> None:
     arms: dict[str, dict] = {}
     all_quality_idx: set[int] = set()
 
-    for j, p in enumerate(probes):
+    for j, name in enumerate(probe_names):
         scores = scores_matrix[:, j]
-        name   = p["name"]
 
         quality_idx    = select_quality(scores, cat_groups, cfg["quality_size"])
         quality_50_idx = select_quality(scores, cat_groups, cfg["quality_size"] // 2)
@@ -292,7 +364,7 @@ def run(cfg: dict) -> None:
         "extraction_layer": cfg.get("extraction_layer", 17),
         "probes": [
             {"name": s["name"], "path": str(probe_dir / (s.get("filename") or f"probe_{s['name']}.pkl"))}
-            for s in cfg["probes"]
+            for s in probe_specs
         ],
         "pool_size": n_pool,
         "arms": arms,
