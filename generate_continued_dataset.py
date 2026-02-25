@@ -132,27 +132,61 @@ def stream_and_score(cfg, manifest, probes, model, captured, device) -> tuple[li
     return pool_rows, scores
 
 
-def select_quality(scores: np.ndarray, n: int) -> list[int]:
-    """Return sorted indices of the top-n rows by probe score."""
-    return sorted(int(i) for i in np.argsort(scores)[::-1][:n].tolist())
+def _group_by_category(pool_rows: list[dict]) -> dict[str, list[int]]:
+    """Map category → pool indices. Rows without a category go into ''."""
+    groups: dict[str, list[int]] = {}
+    for i, r in enumerate(pool_rows):
+        groups.setdefault(r.get("category") or "", []).append(i)
+    return groups
 
 
-def select_random(n: int, exclude: set[int], pool_size: int, seed: int) -> list[int]:
-    """Return n uniformly random indices, excluding the given set."""
-    candidates = [i for i in range(pool_size) if i not in exclude]
+def _category_quotas(cat_groups: dict[str, list[int]], n: int) -> dict[str, int]:
+    """Per-category row quotas summing to n, proportional to group sizes."""
+    total = sum(len(idxs) for idxs in cat_groups.values())
+    raw = {cat: n * len(idxs) / total for cat, idxs in cat_groups.items()}
+    quotas = {cat: int(q) for cat, q in raw.items()}
+    deficit = n - sum(quotas.values())
+    for cat in sorted(raw, key=lambda c: raw[c] - int(raw[c]), reverse=True)[:deficit]:
+        quotas[cat] += 1
+    return quotas
+
+
+def select_quality(scores: np.ndarray, cat_groups: dict[str, list[int]], n: int) -> list[int]:
+    """Return sorted indices of top-n rows by probe score, stratified by category."""
+    quotas = _category_quotas(cat_groups, n)
+    selected: list[int] = []
+    for cat, quota in quotas.items():
+        top = sorted(cat_groups[cat], key=lambda i: float(scores[i]), reverse=True)[:quota]
+        selected.extend(top)
+    return sorted(selected)
+
+
+def select_random(cat_groups: dict[str, list[int]], n: int, exclude: set[int], seed: int) -> list[int]:
+    """Return n uniformly random indices stratified by category, excluding the given set."""
+    quotas = _category_quotas(cat_groups, n)
     rng = np.random.default_rng(seed)
-    return sorted(int(i) for i in rng.choice(candidates, size=n, replace=False).tolist())
+    selected: list[int] = []
+    for cat, quota in quotas.items():
+        candidates = [i for i in cat_groups[cat] if i not in exclude]
+        chosen = rng.choice(candidates, size=min(quota, len(candidates)), replace=False)
+        selected.extend(int(i) for i in chosen)
+    return sorted(selected)
 
 
-def select_label(pool_rows: list[dict], qualities: set[str], n: int) -> list[int]:
-    """Return indices of the top-n rows ranked by LLM quality label."""
+def select_label(pool_rows: list[dict], cat_groups: dict[str, list[int]], qualities: set[str], n: int) -> list[int]:
+    """Return indices of top-n rows by LLM quality label, stratified by category."""
     rank = {"excellent": 3, "good": 2, "fair": 1, "poor": 0}
-    candidates = sorted(
-        [i for i, r in enumerate(pool_rows) if r.get("quality", "").strip().lower() in qualities],
-        key=lambda i: rank.get(pool_rows[i].get("quality", ""), -1),
-        reverse=True,
-    )
-    return sorted(candidates[:n])
+    quotas = _category_quotas(cat_groups, n)
+    selected: list[int] = []
+    for cat, quota in quotas.items():
+        candidates = sorted(
+            [i for i in cat_groups[cat]
+             if pool_rows[i].get("quality", "").strip().lower() in qualities],
+            key=lambda i: rank.get(pool_rows[i].get("quality", ""), -1),
+            reverse=True,
+        )
+        selected.extend(candidates[:quota])
+    return sorted(selected)
 
 
 def save_arm(pool_rows: list[dict], indices: list[int], out_dir: Path, name: str) -> dict:
@@ -212,6 +246,7 @@ def run(cfg: dict) -> None:
     out_dir = run_dir / "continuation"
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    cat_groups = _group_by_category(pool_rows)
     arms: dict[str, dict] = {}
     all_quality_idx: set[int] = set()
 
@@ -219,23 +254,23 @@ def run(cfg: dict) -> None:
         scores = scores_matrix[:, j]
         name   = p["name"]
 
-        quality_idx    = select_quality(scores, cfg["quality_size"])
-        quality_50_idx = select_quality(scores, cfg["quality_size"] // 2)
+        quality_idx    = select_quality(scores, cat_groups, cfg["quality_size"])
+        quality_50_idx = select_quality(scores, cat_groups, cfg["quality_size"] // 2)
         all_quality_idx.update(quality_idx)
 
         arms[f"quality_{name}"]       = save_arm(pool_rows, quality_idx,    out_dir, f"quality_{name}")
         arms[f"quality_{name}_50pct"] = save_arm(pool_rows, quality_50_idx, out_dir, f"quality_{name}_50pct")
 
-    random_idx = select_random(cfg.get("random_size", 10_000), all_quality_idx, n_pool, cfg.get("seed", 42))
+    random_idx = select_random(cat_groups, cfg.get("random_size", 10_000), all_quality_idx, cfg.get("seed", 42))
     arms["random"] = save_arm(pool_rows, random_idx, out_dir, "random")
 
-    random_50_idx = select_random(cfg.get("random_size", 10_000) // 2, all_quality_idx, n_pool, cfg.get("seed", 42))
+    random_50_idx = select_random(cat_groups, cfg.get("random_size", 10_000) // 2, all_quality_idx, cfg.get("seed", 42))
     arms["random_50pct"] = save_arm(pool_rows, random_50_idx, out_dir, "random_50pct")
 
-    label_idx = select_label(pool_rows, {"good", "excellent"}, cfg["quality_size"])
+    label_idx = select_label(pool_rows, cat_groups, {"good", "excellent"}, cfg["quality_size"])
     arms["label_good_excellent"] = save_arm(pool_rows, label_idx, out_dir, "label_good_excellent")
 
-    label_50_idx = select_label(pool_rows, {"good", "excellent"}, cfg["quality_size"] // 2)
+    label_50_idx = select_label(pool_rows, cat_groups, {"good", "excellent"}, cfg["quality_size"] // 2)
     arms["label_good_excellent_50pct"] = save_arm(pool_rows, label_50_idx, out_dir, "label_good_excellent_50pct")
 
     cont_manifest = {
