@@ -118,15 +118,16 @@ def stream_and_score(cfg, manifest, probes, model, captured, device) -> tuple[li
         if len(buffer) >= cfg["batch_size"]:
             flush()
             if len(pool_rows) % 5_000 == 0:
-                print(f"  scored {len(pool_rows):,}/{cfg['pool_size']:,}", flush=True)
-        if len(pool_rows) >= cfg["pool_size"]:
+                limit_str = f"{cfg['pool_size']:,}" if cfg.get("pool_size") else "∞"
+                print(f"  scored {len(pool_rows):,}/{limit_str}", flush=True)
+        if cfg.get("pool_size") and len(pool_rows) >= cfg["pool_size"]:
             break
 
     if buffer:
         flush()
 
-    pool_rows = pool_rows[:cfg["pool_size"]]
-    scores    = np.array(all_scores[:cfg["pool_size"]], dtype=np.float32)
+    pool_rows = pool_rows[:cfg.get("pool_size")]
+    scores    = np.array(all_scores[:cfg.get("pool_size")], dtype=np.float32)
     print(f"Collected {len(pool_rows):,} examples")
     return pool_rows, scores
 

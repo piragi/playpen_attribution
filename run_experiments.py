@@ -88,17 +88,23 @@ CONFIG = {
     # scores_dir defaults to score_output_dir when not set per-probe
     "probes": [{"name": "math_da"}],
     "extraction_layer": 17,
-    "probe_adapter_path": None,      # None → use base model for embedding extraction
+    "probe_adapter_path": None,      # None → use {run_dir}/adapter; set to override
     "ridge_alpha": 100.0,
     "val_frac": 0.20,
     "probe_batch_size": 64,
 
     # ── generate_continued_dataset ───────────────────────────────────────────
-    "pool_size": 30_000,
+    "pool_size": None,
     "quality_size": 10_000,
     "random_size": 10_000,
     "gen_batch_size": 64,
-    "gen_adapter_path": None,        # None → use base model for embedding extraction
+    "gen_adapter_path": None,        # None → use {run_dir}/adapter; set to override
+
+    # ── finetune / eval continuation arms (steps 6–8) ────────────────────────
+    # Set finetune_seed to re-run steps 6–8 with different randomness (random arm
+    # selection + LoRA training) without re-running steps 1–5. Adapters/evals are
+    # tagged _s{finetune_seed} so previous results are never overwritten.
+    "finetune_seed": [43,44,45],           # None → use seed; set e.g. 43, 44, 45 for multi-seed runs
 
     # ── eval_harness ─────────────────────────────────────────────────────────
     "run_eval": True,
@@ -135,6 +141,13 @@ def main() -> None:
     cfg = dict(SMOKE_CONFIG if "--smoke" in sys.argv else CONFIG)
     run_dir = Path(cfg["run_dir"])
 
+    # Default embedding extraction to the trained base adapter.
+    base_adapter = str(run_dir / "adapter")
+    if cfg.get("probe_adapter_path") is None:
+        cfg["probe_adapter_path"] = base_adapter
+    if cfg.get("gen_adapter_path") is None:
+        cfg["gen_adapter_path"] = base_adapter
+
     print("\n=== 1) build_sft_data ===")
     build_sft_data.run(cfg)
 
@@ -154,19 +167,22 @@ def main() -> None:
     _clear_gpu()
 
     print("\n=== 6) generate_continued_dataset ===")
-    generate_continued_dataset.run(cfg)
+    finetune_seed = cfg.get("finetune_seed") or cfg["seed"]
+    generate_continued_dataset.run({**cfg, "seed": finetune_seed})
     _clear_gpu()
 
     print("\n=== 7) finetune continuation arms ===")
     cont_manifest = json.loads((run_dir / "continuation" / "continuation_manifest.json").read_text())
     val_data = json.loads((run_dir / "manifest.json").read_text())["splits"]["val"]["path"]
+    seed_tag = f"_s{finetune_seed}" if cfg.get("finetune_seed") is not None else ""
     for arm_name, arm_info in cont_manifest["arms"].items():
         print(f"\n  --- arm: {arm_name} ---")
         finetune.run({
             **cfg,
+            "seed": finetune_seed,
             "train_data": arm_info["path"],
             "val_data": val_data,
-            "output_dir": str(run_dir / f"adapter_{arm_name}"),
+            "output_dir": str(run_dir / f"adapter_{arm_name}{seed_tag}"),
         })
         _clear_gpu()
 
@@ -177,8 +193,8 @@ def main() -> None:
         for arm_name in cont_manifest["arms"]:
             eval_harness.run({
                 **cfg,
-                "adapter_path": str(run_dir / f"adapter_{arm_name}"),
-                "output_json": str(eval_dir / f"{arm_name}.json"),
+                "adapter_path": str(run_dir / f"adapter_{arm_name}{seed_tag}"),
+                "output_json": str(eval_dir / f"{arm_name}{seed_tag}.json"),
                 "apply_chat_template": True,
             })
 
