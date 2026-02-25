@@ -39,6 +39,7 @@ CONFIG = {
     "run_dir": "runs/smoltalk_v5",
     "base_model": "HuggingFaceTB/SmolLM2-1.7B",
     "seed": 42,
+    "exp_tag": "",  # optional suffix for continuation outputs (e.g. "ms1200_lr3e-4")
 
     # ── build_sft_data ───────────────────────────────────────────────────────
     "dataset_name": "HuggingFaceTB/smoltalk",
@@ -172,6 +173,8 @@ def main() -> None:
         else [cfg["seed"]] if seed_cfg is None
         else [seed_cfg]
     )
+    exp_tag = str(cfg.get("exp_tag", "")).strip()
+    exp_suffix = f"_{exp_tag}" if exp_tag else ""
     val_data = json.loads((run_dir / "manifest.json").read_text())["splits"]["val"]["path"]
 
     for finetune_seed in finetune_seeds:
@@ -190,7 +193,7 @@ def main() -> None:
                 "seed": finetune_seed,
                 "train_data": arm_info["path"],
                 "val_data": val_data,
-                "output_dir": str(run_dir / f"adapter_{arm_name}{seed_tag}"),
+                "output_dir": str(run_dir / f"adapter_{arm_name}{exp_suffix}{seed_tag}"),
             })
             _clear_gpu()
 
@@ -201,8 +204,8 @@ def main() -> None:
             for arm_name in cont_manifest["arms"]:
                 eval_harness.run({
                     **cfg,
-                    "adapter_path": str(run_dir / f"adapter_{arm_name}{seed_tag}"),
-                    "output_json": str(eval_dir / f"{arm_name}{seed_tag}.json"),
+                    "adapter_path": str(run_dir / f"adapter_{arm_name}{exp_suffix}{seed_tag}"),
+                    "output_json": str(eval_dir / f"{arm_name}{exp_suffix}{seed_tag}.json"),
                     "apply_chat_template": True,
                 })
 
