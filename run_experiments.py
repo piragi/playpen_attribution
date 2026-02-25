@@ -53,6 +53,7 @@ CONFIG = {
 
     # ── finetune ─────────────────────────────────────────────────────────────
     "num_train_epochs": 2,
+    "max_steps": 300,
     "learning_rate": 3e-4,
     "warmup_ratio": 0.03,
     "weight_decay": 0.01,
@@ -68,7 +69,7 @@ CONFIG = {
     "lora_target_modules": "q_proj,k_proj,v_proj,o_proj",
 
     # ── rebuild_attr_query ───────────────────────────────────────────────────
-    "query_category": 30_000,          # None | "math" | "data-analysis" | "all"
+    "query_category": None,          # None | "math" | "data-analysis" | "all"
     "query_smol_size": 4096,
     "query_quality_min": {"good", "excellent"},
 
@@ -95,7 +96,7 @@ CONFIG = {
     "probe_batch_size": 64,
 
     # ── generate_continued_dataset ───────────────────────────────────────────
-    "pool_size": None,
+    "pool_size": 30_000,
     "quality_size": 10_000,
     "random_size": 10_000,
     "gen_batch_size": 64,
@@ -105,7 +106,7 @@ CONFIG = {
     # Set finetune_seed to re-run steps 6–8 with different randomness (random arm
     # selection + LoRA training) without re-running steps 1–5. Adapters/evals are
     # tagged _s{finetune_seed} so previous results are never overwritten.
-    "finetune_seed": [44,45],           # None → use seed; set e.g. 43, 44, 45 for multi-seed runs
+    "finetune_seed": [43],           # None → use seed; set e.g. 43, 44, 45 for multi-seed runs
 
     # ── eval_harness ─────────────────────────────────────────────────────────
     "run_eval": True,
