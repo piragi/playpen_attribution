@@ -36,7 +36,7 @@ import score
 
 CONFIG = {
     # ── Shared ───────────────────────────────────────────────────────────────
-    "run_dir": "runs/smoltalk_v4",
+    "run_dir": "runs/smoltalk_v5",
     "base_model": "HuggingFaceTB/SmolLM2-1.7B",
     "seed": 42,
 
@@ -67,12 +67,12 @@ CONFIG = {
     "lora_target_modules": "q_proj,k_proj,v_proj,o_proj",
 
     # ── rebuild_attr_query ───────────────────────────────────────────────────
-    "query_category": None,          # None | "math" | "data-analysis" | "all"
+    "query_category": 30_000,          # None | "math" | "data-analysis" | "all"
     "query_smol_size": 4096,
     "query_quality_min": {"good", "excellent"},
 
     # ── score ────────────────────────────────────────────────────────────────
-    "score_output_dir": "runs/smoltalk_v4/scores_math_da",
+    "score_output_dir": "runs/smoltalk_v5/scores_math_da",
     "query_split": "attr_query",
     "pool_split": "score_pool",
     "projection_dim": 32,
@@ -104,7 +104,7 @@ CONFIG = {
     # Set finetune_seed to re-run steps 6–8 with different randomness (random arm
     # selection + LoRA training) without re-running steps 1–5. Adapters/evals are
     # tagged _s{finetune_seed} so previous results are never overwritten.
-    "finetune_seed": [43,44,45],           # None → use seed; set e.g. 43, 44, 45 for multi-seed runs
+    "finetune_seed": [44,45],           # None → use seed; set e.g. 43, 44, 45 for multi-seed runs
 
     # ── eval_harness ─────────────────────────────────────────────────────────
     "run_eval": True,
@@ -148,23 +148,23 @@ def main() -> None:
     if cfg.get("gen_adapter_path") is None:
         cfg["gen_adapter_path"] = base_adapter
 
-    print("\n=== 1) build_sft_data ===")
-    build_sft_data.run(cfg)
-
-    print("\n=== 2) finetune base adapter ===")
-    finetune.run(cfg)
-    _clear_gpu()
-
-    print("\n=== 3) rebuild_attr_query ===")
-    rebuild_attr_query.run(cfg)
-
-    print("\n=== 4) score ===")
-    score.run(cfg)
-    _clear_gpu()
-
-    print("\n=== 5) probe ===")
-    probe.run(cfg)
-    _clear_gpu()
+    # print("\n=== 1) build_sft_data ===")
+    # build_sft_data.run(cfg)
+# 
+    # print("\n=== 2) finetune base adapter ===")
+    # finetune.run(cfg)
+    # _clear_gpu()
+# 
+    # print("\n=== 3) rebuild_attr_query ===")
+    # rebuild_attr_query.run(cfg)
+# 
+    # print("\n=== 4) score ===")
+    # score.run(cfg)
+    # _clear_gpu()
+# 
+    # print("\n=== 5) probe ===")
+    # probe.run(cfg)
+    # _clear_gpu()
 
     seed_cfg = cfg.get("finetune_seed")
     finetune_seeds = (
