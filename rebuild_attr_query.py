@@ -35,9 +35,9 @@ from pipeline_common import (
 ensure_hf_home_env()
 
 CONFIG = {
-    "manifest_path": "runs/smoltalk_v4/manifest.json",
+    "run_dir": "runs/smoltalk_v4",
     "query_smol_size": 4096,
-    "quality_min": {"good", "excellent"},
+    "query_quality_min": {"good", "excellent"},
     "category_filter": {"math", "data-analysis"},
 }
 
@@ -47,22 +47,10 @@ _CATEGORY_KEY = {
 }
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Rebuild attr_query, optionally filtered to one category.")
-    parser.add_argument(
-        "--category",
-        type=str,
-        default=None,
-        choices=sorted(CONFIG["category_filter"]) + ["all"],
-        help="Category to filter to. Omit or pass 'all' for no category filter.",
-    )
-    args = parser.parse_args()
-
-    cfg = dict(CONFIG)
-    if args.category and args.category != "all":
-        cfg["category_filter"] = {args.category}
-
-    manifest = json.loads(Path(cfg["manifest_path"]).read_text())
+def run(cfg: dict) -> None:
+    run_dir = Path(cfg["run_dir"])
+    manifest_path = run_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
     base_model = manifest.get("base_model", DEFAULT_BASE_MODEL)
     tokenizer = load_tokenizer(base_model)
 
@@ -73,8 +61,12 @@ def main() -> None:
         if skip_rows:
             print(f"  skipping first {skip_rows:,} raw rows (consumed by build_sft_data.py)")
 
-    quality_ok = cfg["quality_min"]
+    quality_ok = cfg.get("query_quality_min", {"good", "excellent"})
     category_filter = cfg.get("category_filter")
+    # Allow a single-category override via query_category key.
+    if cfg.get("query_category") and cfg["query_category"] != "all":
+        category_filter = {cfg["query_category"]}
+
     print(f"Loading {manifest['dataset']}/smol-magpie-ultra ...")
     print(f"  quality filter:  {quality_ok}")
     print(f"  category filter: {sorted(category_filter) if category_filter else 'all'}")
@@ -108,7 +100,7 @@ def main() -> None:
         category_dist[category] = category_dist.get(category, 0) + 1
         candidate_rows.append(tok)
 
-        if len(candidate_rows) >= cfg["query_smol_size"]:
+        if len(candidate_rows) >= cfg.get("query_smol_size", 4096):
             break
 
     if not candidate_rows:
@@ -132,7 +124,7 @@ def main() -> None:
     else:
         split_key = "attr_query"
 
-    default_path = str(Path(cfg["manifest_path"]).parent / "data" / split_key)
+    default_path = str(run_dir / "data" / split_key)
     out_path = Path(manifest.get("splits", {}).get(split_key, {}).get("path", default_path))
     if out_path.exists():
         shutil.rmtree(out_path)
@@ -143,14 +135,25 @@ def main() -> None:
         "rows": len(query_ds),
         "total_tokens": int(sum(query_ds["length"])),
     }
-    Path(cfg["manifest_path"]).write_text(json.dumps(manifest, indent=2))
-
+    manifest_path.write_text(json.dumps(manifest, indent=2))
     print(f"\nSaved {len(query_ds)} rows → {out_path}  (manifest key: {split_key})")
-    run_dir = str(Path(cfg["manifest_path"]).parent)
-    print("\nNext: rerun score.py with the new query:")
-    print(f"  uv run score.py --adapter-path {run_dir}/adapter "
-          f"--query-split {split_key} "
-          f"--output-dir {run_dir}/scores_{split_key}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Rebuild attr_query, optionally filtered to one category.")
+    parser.add_argument(
+        "--category",
+        type=str,
+        default=None,
+        choices=sorted(CONFIG["category_filter"]) + ["all"],
+        help="Category to filter to. Omit or pass 'all' for no category filter.",
+    )
+    args = parser.parse_args()
+
+    cfg = dict(CONFIG)
+    if args.category:
+        cfg["query_category"] = args.category
+    run(cfg)
 
 
 if __name__ == "__main__":

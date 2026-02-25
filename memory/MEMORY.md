@@ -8,7 +8,11 @@ Pipeline: build_sft_data → finetune → rebuild_attr_query → score → probe
 - CONFIG dicts in each file (not YAML), intentional for researcher readability
 - Token-budget matching for random arm was dropped (too complex, not empirically critical)
 - Quality-labels ablation in probe.py was removed (no longer used)
-- Ablation arms: quality_{probe}, quality_{probe}_50pct, random (uniform), label_good_excellent
+- Ablation arms: quality_{probe}, quality_{probe}_50pct, random, random_50pct, label_good_excellent, label_good_excellent_50pct
+- All scripts expose run(cfg: dict) — no subprocess in run_experiments.py
+- Single CONFIG in run_experiments.py controls all steps; comment out steps freely to re-run from any point
+- SMOKE_CONFIG in run_experiments.py for validation: uv run run_experiments.py --smoke
+- _clear_gpu() called between GPU-heavy steps (bergson retains GPU memory without it)
 
 ## Shared helpers live in pipeline_common.py
 - `load_tokenizer(base_model)` — IT model + pad_token setup

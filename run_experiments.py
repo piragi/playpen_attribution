@@ -1,189 +1,186 @@
-"""Run the end-to-end attribution pipeline with simple sequential steps.
+"""Run the end-to-end attribution pipeline.
 
-Default flow:
-  1) build_sft_data.py
-  2) finetune.py (base adapter)
-  3) rebuild_attr_query.py
-  4) score.py
-  5) probe.py
-  6) generate_continued_dataset.py
-  7) finetune.py (all continuation arms)
-  8) eval_harness.py (all continuation arms)
+One CONFIG dict controls every step. Comment out steps you've already run
+and adjust the config freely — each step reads only the keys it needs.
+
+Flow:
+  1) build_sft_data
+  2) finetune (base adapter)
+  3) rebuild_attr_query
+  4) score
+  5) probe
+  6) generate_continued_dataset
+  7) finetune (all continuation arms)
+  8) eval_harness (all continuation arms)
 
 Usage:
     uv run run_experiments.py
 """
 from __future__ import annotations
 
+import gc
 import json
-import shlex
-import subprocess
 import sys
 from pathlib import Path
 
+import torch
+
+import build_sft_data
+import eval_harness
+import finetune
+import generate_continued_dataset
+import probe
+import rebuild_attr_query
+import score
+
 
 CONFIG = {
+    # ── Shared ───────────────────────────────────────────────────────────────
     "run_dir": "runs/smoltalk_v4",
-    "python": sys.executable,
+    "base_model": "HuggingFaceTB/SmolLM2-1.7B",
+    "seed": 42,
+
+    # ── build_sft_data ───────────────────────────────────────────────────────
+    "dataset_name": "HuggingFaceTB/smoltalk",
+    "dataset_config": "smol-magpie-ultra",
+    "max_length": 2048,
+    "category_filter": {"math", "data-analysis"},
+    "train_size": 5_000,
+    "val_size": 500,
+    "attr_pool_size": 0,
     "smoke_test": False,
-    "query_category": None,  # None | "math" | "data-analysis" | "all"
+
+    # ── finetune ─────────────────────────────────────────────────────────────
+    "num_train_epochs": 2,
+    "learning_rate": 3e-4,
+    "warmup_ratio": 0.03,
+    "weight_decay": 0.01,
+    "lr_scheduler_type": "cosine",
+    "per_device_train_batch_size": 8,
+    "gradient_accumulation_steps": 4,
+    "logging_steps": 20,
+    "save_steps": 500,
+    "save_total_limit": 2,
+    "lora_r": 16,
+    "lora_alpha": 32,
+    "lora_dropout": 0.05,
+    "lora_target_modules": "q_proj,k_proj,v_proj,o_proj",
+
+    # ── rebuild_attr_query ───────────────────────────────────────────────────
+    "query_category": None,          # None | "math" | "data-analysis" | "all"
+    "query_smol_size": 4096,
+    "query_quality_min": {"good", "excellent"},
+
+    # ── score ────────────────────────────────────────────────────────────────
     "score_output_dir": "runs/smoltalk_v4/scores_math_da",
+    "query_split": "attr_query",
+    "pool_split": "score_pool",
+    "projection_dim": 32,
+    "token_batch_size": 2048,
+    "preconditioning_mode": "query",
+    "mixing_coefficient": 0.99,
+    "score_mode": "mean",
+    "unit_normalize": True,
+    "loss_reduction": "mean",
+    "label_smoothing": 0.0,
+
+    # ── probe ────────────────────────────────────────────────────────────────
+    # scores_dir defaults to score_output_dir when not set per-probe
+    "probes": [{"name": "math_da"}],
+    "extraction_layer": 17,
+    "probe_adapter_path": None,      # None → use base model for embedding extraction
+    "ridge_alpha": 100.0,
+    "val_frac": 0.20,
+    "probe_batch_size": 64,
+
+    # ── generate_continued_dataset ───────────────────────────────────────────
+    "pool_size": 30_000,
+    "quality_size": 10_000,
+    "random_size": 10_000,
+    "gen_batch_size": 64,
+    "gen_adapter_path": None,        # None → use base model for embedding extraction
+
+    # ── eval_harness ─────────────────────────────────────────────────────────
     "run_eval": True,
     "eval_tasks": "arc_challenge,arc_easy,hellaswag,winogrande,ifeval,gsm8k",
-    "eval_batch_size": "auto",
+    "eval_batch_size": "32",
+}
+
+SMOKE_CONFIG = {
+    **CONFIG,
+    "run_dir": "runs/smoke_test",
+    "train_size": 64,
+    "val_size": 20,
+    "attr_pool_size": 50,
+    "query_smol_size": 64,
+    "pool_size": 200,
+    "quality_size": 50,
+    "random_size": 50,
+    "per_device_train_batch_size": 2,
+    "gradient_accumulation_steps": 1,
+    "num_train_epochs": 1,
+    "probe_batch_size": 8,
+    "gen_batch_size": 8,
+    "run_eval": False,
 }
 
 
-def run_command(cmd: list[str]) -> None:
-    print(f"$ {shlex.join(cmd)}", flush=True)
-    subprocess.run(cmd, check=True)
-
-
-def load_json(path: Path) -> dict:
-    return json.loads(path.read_text())
-
-
-def validate_config(cfg: dict) -> None:
-    # rebuild_attr_query.py, probe.py, and generate_continued_dataset.py currently
-    # use in-file CONFIG defaults, so this runner assumes the default run dir.
-    if cfg["run_dir"] != "runs/smoltalk_v4":
-        raise ValueError("run_dir must be 'runs/smoltalk_v4' with current script defaults.")
-
-
-def step_build_sft_data(cfg: dict) -> None:
-    cmd = [cfg["python"], "build_sft_data.py", "--output-dir", cfg["run_dir"]]
-    if cfg["smoke_test"]:
-        cmd.append("--smoke-test")
-    run_command(cmd)
-
-
-def step_finetune_base(cfg: dict, manifest: dict) -> None:
-    run_dir = Path(cfg["run_dir"])
-    run_command(
-        [
-            cfg["python"],
-            "finetune.py",
-            "--base-model",
-            manifest["base_model"],
-            "--train-data",
-            manifest["splits"]["train"]["path"],
-            "--val-data",
-            manifest["splits"]["val"]["path"],
-            "--output-dir",
-            str(run_dir / "adapter"),
-        ]
-    )
-
-
-def step_rebuild_attr_query(cfg: dict) -> None:
-    cmd = [cfg["python"], "rebuild_attr_query.py"]
-    if cfg["query_category"] is not None:
-        cmd.extend(["--category", str(cfg["query_category"])])
-    run_command(cmd)
-
-
-def step_score(cfg: dict) -> None:
-    run_dir = Path(cfg["run_dir"])
-    run_command(
-        [
-            cfg["python"],
-            "score.py",
-            "--manifest",
-            str(run_dir / "manifest.json"),
-            "--adapter-path",
-            str(run_dir / "adapter"),
-            "--output-dir",
-            cfg["score_output_dir"],
-        ]
-    )
-
-
-def step_probe(cfg: dict) -> None:
-    run_command([cfg["python"], "probe.py"])
-
-
-def step_generate_continued(cfg: dict) -> None:
-    run_command([cfg["python"], "generate_continued_dataset.py"])
-
-
-def step_finetune_arms(cfg: dict, manifest: dict) -> dict[str, str]:
-    run_dir = Path(cfg["run_dir"])
-    cont_manifest = load_json(run_dir / "continuation" / "continuation_manifest.json")
-    adapter_by_arm: dict[str, str] = {}
-    for arm_name, arm_info in cont_manifest["arms"].items():
-        adapter_dir = run_dir / f"adapter_{arm_name}"
-        run_command(
-            [
-                cfg["python"],
-                "finetune.py",
-                "--base-model",
-                manifest["base_model"],
-                "--train-data",
-                arm_info["path"],
-                "--val-data",
-                manifest["splits"]["val"]["path"],
-                "--output-dir",
-                str(adapter_dir),
-            ]
-        )
-        adapter_by_arm[arm_name] = str(adapter_dir)
-    return adapter_by_arm
-
-
-def step_eval_arms(cfg: dict, manifest: dict, adapter_by_arm: dict[str, str]) -> None:
-    if not cfg["run_eval"]:
-        return
-    eval_dir = Path(cfg["run_dir"]) / "evals"
-    eval_dir.mkdir(parents=True, exist_ok=True)
-    for arm_name, adapter_dir in adapter_by_arm.items():
-        run_command(
-            [
-                cfg["python"],
-                "eval_harness.py",
-                "--base-model",
-                manifest["base_model"],
-                "--adapter-path",
-                adapter_dir,
-                "--tasks",
-                cfg["eval_tasks"],
-                "--apply-chat-template",
-                "--batch-size",
-                cfg["eval_batch_size"],
-                "--output-json",
-                str(eval_dir / f"{arm_name}.json"),
-            ]
-        )
+def _clear_gpu() -> None:
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def main() -> None:
-    cfg = dict(CONFIG)
-    validate_config(cfg)
+    cfg = dict(SMOKE_CONFIG if "--smoke" in sys.argv else CONFIG)
     run_dir = Path(cfg["run_dir"])
 
     print("\n=== 1) build_sft_data ===")
-    step_build_sft_data(cfg)
-    manifest = load_json(run_dir / "manifest.json")
+    build_sft_data.run(cfg)
 
     print("\n=== 2) finetune base adapter ===")
-    step_finetune_base(cfg, manifest)
+    finetune.run(cfg)
+    _clear_gpu()
 
     print("\n=== 3) rebuild_attr_query ===")
-    step_rebuild_attr_query(cfg)
+    rebuild_attr_query.run(cfg)
 
     print("\n=== 4) score ===")
-    step_score(cfg)
+    score.run(cfg)
+    _clear_gpu()
 
     print("\n=== 5) probe ===")
-    step_probe(cfg)
+    probe.run(cfg)
+    _clear_gpu()
 
     print("\n=== 6) generate_continued_dataset ===")
-    step_generate_continued(cfg)
+    generate_continued_dataset.run(cfg)
+    _clear_gpu()
 
     print("\n=== 7) finetune continuation arms ===")
-    adapter_by_arm = step_finetune_arms(cfg, manifest)
+    cont_manifest = json.loads((run_dir / "continuation" / "continuation_manifest.json").read_text())
+    val_data = json.loads((run_dir / "manifest.json").read_text())["splits"]["val"]["path"]
+    for arm_name, arm_info in cont_manifest["arms"].items():
+        print(f"\n  --- arm: {arm_name} ---")
+        finetune.run({
+            **cfg,
+            "train_data": arm_info["path"],
+            "val_data": val_data,
+            "output_dir": str(run_dir / f"adapter_{arm_name}"),
+        })
+        _clear_gpu()
 
     print("\n=== 8) eval continuation arms ===")
-    step_eval_arms(cfg, manifest, adapter_by_arm)
+    if cfg["run_eval"]:
+        eval_dir = run_dir / "evals"
+        eval_dir.mkdir(parents=True, exist_ok=True)
+        for arm_name in cont_manifest["arms"]:
+            eval_harness.run({
+                **cfg,
+                "adapter_path": str(run_dir / f"adapter_{arm_name}"),
+                "output_json": str(eval_dir / f"{arm_name}.json"),
+                "apply_chat_template": True,
+            })
 
     print("\nDone.")
 

@@ -85,7 +85,26 @@ def build_model_args(args: argparse.Namespace) -> str:
     return ",".join(parts)
 
 
-def run(args: argparse.Namespace) -> None:
+def run(cfg: dict) -> None:
+    """Run lm-eval from a config dict.
+
+    Required keys: base_model, adapter_path, output_json
+    Optional keys: tasks, eval_batch_size, apply_chat_template, num_fewshot, limit
+    """
+    args = argparse.Namespace(
+        base_model=cfg["base_model"],
+        adapter_path=cfg.get("adapter_path"),
+        tasks=cfg.get("eval_tasks", DEFAULT_TASKS),
+        num_fewshot=cfg.get("num_fewshot", -1),
+        limit=cfg.get("limit", 0),
+        batch_size=cfg.get("eval_batch_size", "8"),
+        apply_chat_template=cfg.get("apply_chat_template", True),
+        output_json=cfg["output_json"],
+    )
+    run_from_args(args)
+
+
+def run_from_args(args: argparse.Namespace) -> None:
     tasks = [t.strip() for t in args.tasks.split(",") if t.strip()]
     model_args = build_model_args(args)
     num_fewshot = args.num_fewshot if args.num_fewshot >= 0 else None
@@ -209,7 +228,7 @@ def make_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = make_parser().parse_args()
-    run(args)
+    run_from_args(args)
 
 
 if __name__ == "__main__":

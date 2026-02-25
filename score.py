@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import shutil
+import types
 from pathlib import Path
 
 import numpy as np
@@ -244,27 +245,36 @@ def write_summary(rows: list[dict], out_path: Path) -> None:
     out_path.write_text(json.dumps(summary, indent=2))
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Minimal Bergson scoring pipeline.")
-    parser.add_argument("--manifest", type=str, default="runs/smoltalk_v4/manifest.json")
-    parser.add_argument("--pool-split", type=str, default="score_pool")
-    parser.add_argument("--query-split", type=str, default="attr_query")
-    parser.add_argument("--adapter-path", type=str, default=None,
-                        help="PEFT adapter path. If omitted, --base-model is used directly.")
-    parser.add_argument("--base-model", type=str, default=DEFAULT_BASE_MODEL)
-    parser.add_argument("--output-dir", type=str, default="runs/smoltalk_v4/scores_math_da")
-    parser.add_argument("--token-batch-size", type=int, default=2048)
-    parser.add_argument("--projection-dim", type=int, default=32)
-    parser.add_argument("--preconditioning-mode", choices=["none", "query", "mixed"], default="query")
-    parser.add_argument("--mixing-coefficient", type=float, default=0.99)
-    parser.add_argument("--score-mode", choices=["mean", "nearest"], default="mean")
-    parser.add_argument("--unit-normalize", dest="unit_normalize", action="store_true")
-    parser.add_argument("--no-unit-normalize", dest="unit_normalize", action="store_false")
-    parser.add_argument("--loss-reduction", choices=["mean", "sum"], default="mean")
-    parser.add_argument("--label-smoothing", type=float, default=0.0)
-    parser.set_defaults(unit_normalize=True)
-    args = parser.parse_args()
+def run(cfg: dict) -> None:
+    """Run the Bergson scoring pipeline from a config dict.
 
+    Standard paths derived from cfg["run_dir"] when not explicitly set:
+      manifest       → {run_dir}/manifest.json
+      adapter_path   → {run_dir}/adapter
+      score_output_dir → {run_dir}/scores
+    """
+    run_dir = Path(cfg["run_dir"])
+    args = types.SimpleNamespace(
+        manifest=cfg.get("manifest") or str(run_dir / "manifest.json"),
+        adapter_path=cfg.get("adapter_path") or str(run_dir / "adapter"),
+        base_model=cfg["base_model"],
+        pool_split=cfg.get("pool_split", "score_pool"),
+        query_split=cfg.get("query_split", "attr_query"),
+        output_dir=cfg.get("score_output_dir") or str(run_dir / "scores"),
+        token_batch_size=cfg.get("token_batch_size", 2048),
+        projection_dim=cfg.get("projection_dim", 32),
+        preconditioning_mode=cfg.get("preconditioning_mode", "query"),
+        mixing_coefficient=cfg.get("mixing_coefficient", 0.99),
+        score_mode=cfg.get("score_mode", "mean"),
+        unit_normalize=cfg.get("unit_normalize", True),
+        loss_reduction=cfg.get("loss_reduction", "mean"),
+        label_smoothing=cfg.get("label_smoothing", 0.0),
+    )
+    _run_scoring(args)
+
+
+def _run_scoring(args) -> None:
+    """Core scoring logic; accepts an argparse.Namespace or SimpleNamespace."""
     manifest = load_manifest(args.manifest)
     pool_source = split_path(manifest, args.pool_split)
     query_source = split_path(manifest, args.query_split)
@@ -289,14 +299,9 @@ def main() -> None:
         if p.exists():
             remove_path(p)
 
-    # Resolve the effective model handle: adapter if given, else the base model ID.
-    # Overwrite args.adapter_path so downstream config uses one value consistently.
     if args.adapter_path:
         ensure_adapter_config(Path(args.adapter_path), args.base_model)
     else:
-        # No adapter: use the base model ID directly.
-        # Do NOT call ensure_adapter_config — it would create a local stub directory
-        # with only config.json and no tokenizer files, causing tokenizer load failures.
         args.adapter_path = args.base_model
 
     use_query_pre = args.preconditioning_mode in {"query", "mixed"}
@@ -325,6 +330,29 @@ def main() -> None:
 
     print(f"row diagnostics: {diagnostics_path}")
     print(f"summary:         {summary_path}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Minimal Bergson scoring pipeline.")
+    parser.add_argument("--manifest", type=str, default="runs/smoltalk_v4/manifest.json")
+    parser.add_argument("--pool-split", type=str, default="score_pool")
+    parser.add_argument("--query-split", type=str, default="attr_query")
+    parser.add_argument("--adapter-path", type=str, default=None,
+                        help="PEFT adapter path. If omitted, --base-model is used directly.")
+    parser.add_argument("--base-model", type=str, default=DEFAULT_BASE_MODEL)
+    parser.add_argument("--output-dir", type=str, default="runs/smoltalk_v4/scores_math_da")
+    parser.add_argument("--token-batch-size", type=int, default=2048)
+    parser.add_argument("--projection-dim", type=int, default=32)
+    parser.add_argument("--preconditioning-mode", choices=["none", "query", "mixed"], default="query")
+    parser.add_argument("--mixing-coefficient", type=float, default=0.99)
+    parser.add_argument("--score-mode", choices=["mean", "nearest"], default="mean")
+    parser.add_argument("--unit-normalize", dest="unit_normalize", action="store_true")
+    parser.add_argument("--no-unit-normalize", dest="unit_normalize", action="store_false")
+    parser.add_argument("--loss-reduction", choices=["mean", "sum"], default="mean")
+    parser.add_argument("--label-smoothing", type=float, default=0.0)
+    parser.set_defaults(unit_normalize=True)
+    args = parser.parse_args()
+    _run_scoring(args)
 
 
 if __name__ == "__main__":

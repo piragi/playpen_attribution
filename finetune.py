@@ -14,8 +14,10 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import sys
+import types
 from pathlib import Path
 
 import torch
@@ -171,6 +173,11 @@ def run_train(args: argparse.Namespace) -> None:
     (out_dir / "train_metrics.json").write_text(json.dumps(payload, indent=2))
     print(f"Adapter saved to: {out_dir}")
 
+    del model, trainer
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
 
 # ---------------------------------------------------------------------------
 # Merge
@@ -191,6 +198,48 @@ def run_merge(args: argparse.Namespace) -> None:
     merged.save_pretrained(out_dir)
     AutoTokenizer.from_pretrained(args.adapter_path).save_pretrained(out_dir)
     print(f"Merged model saved to: {out_dir}")
+
+
+# ---------------------------------------------------------------------------
+# API entry point
+# ---------------------------------------------------------------------------
+
+def run(cfg: dict) -> None:
+    """Train a LoRA adapter from a config dict.
+
+    Standard paths are derived from cfg["run_dir"] when not explicitly set:
+      train_data  → {run_dir}/data/train
+      val_data    → {run_dir}/data/val
+      output_dir  → {run_dir}/adapter
+    Override any of these by setting them explicitly in cfg.
+    """
+    run_dir = Path(cfg["run_dir"])
+    c = CONFIG
+    args = types.SimpleNamespace(
+        base_model=cfg.get("base_model", c["base_model"]),
+        train_data=cfg.get("train_data") or str(run_dir / "data" / "train"),
+        val_data=cfg.get("val_data") or str(run_dir / "data" / "val"),
+        output_dir=cfg.get("output_dir") or str(run_dir / "adapter"),
+        resume_adapter=cfg.get("resume_adapter"),
+        resume_from_checkpoint=cfg.get("resume_from_checkpoint"),
+        num_train_epochs=cfg.get("num_train_epochs", c["num_train_epochs"]),
+        max_steps=cfg.get("max_steps", -1),
+        learning_rate=cfg.get("learning_rate", c["learning_rate"]),
+        per_device_train_batch_size=cfg.get("per_device_train_batch_size", c["per_device_train_batch_size"]),
+        gradient_accumulation_steps=cfg.get("gradient_accumulation_steps", c["gradient_accumulation_steps"]),
+        warmup_ratio=cfg.get("warmup_ratio", c["warmup_ratio"]),
+        lr_scheduler_type=cfg.get("lr_scheduler_type", c["lr_scheduler_type"]),
+        weight_decay=cfg.get("weight_decay", c["weight_decay"]),
+        logging_steps=cfg.get("logging_steps", c["logging_steps"]),
+        save_steps=cfg.get("save_steps", c["save_steps"]),
+        save_total_limit=cfg.get("save_total_limit", c["save_total_limit"]),
+        seed=cfg.get("seed", c["seed"]),
+        lora_r=cfg.get("lora_r", c["lora_r"]),
+        lora_alpha=cfg.get("lora_alpha", c["lora_alpha"]),
+        lora_dropout=cfg.get("lora_dropout", c["lora_dropout"]),
+        lora_target_modules=cfg.get("lora_target_modules", c["lora_target_modules"]),
+    )
+    run_train(args)
 
 
 # ---------------------------------------------------------------------------

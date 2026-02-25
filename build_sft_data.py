@@ -51,7 +51,7 @@ CONFIG = {
     "val_size": 500,
     # Set to 0 to score the train split itself (score_pool → train in manifest).
     "attr_pool_size": 0,
-    "output_dir": "runs/smoltalk_v4",
+    "run_dir": "runs/smoltalk_v4",
     "seed": 42,
 }
 
@@ -60,7 +60,7 @@ SMOKE_CONFIG = {
     "train_size": 64,
     "val_size": 20,
     "attr_pool_size": 50,
-    "output_dir": "runs/smoke_test",
+    "run_dir": "runs/smoke_test",
 }
 
 
@@ -117,18 +117,8 @@ def build_smoltalk_splits(tokenizer, cfg: dict) -> tuple[Dataset, Dataset, Datas
 # Main
 # ---------------------------------------------------------------------------
 
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--smoke-test", action="store_true",
-                        help="Tiny sizes for end-to-end pipeline validation.")
-    parser.add_argument("--output-dir", type=str, default=None)
-    args = parser.parse_args()
-
-    cfg = dict(SMOKE_CONFIG if args.smoke_test else CONFIG)
-    if args.output_dir:
-        cfg["output_dir"] = args.output_dir
-
-    out = Path(cfg["output_dir"])
+def run(cfg: dict) -> None:
+    out = Path(cfg["run_dir"])
     out.mkdir(parents=True, exist_ok=True)
 
     tokenizer = load_tokenizer(cfg["base_model"])
@@ -164,11 +154,19 @@ def main() -> None:
     manifest_path = out / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2))
     print(f"\nManifest written to: {manifest_path}")
-    run_dir = str(out)
-    print("\nNext steps:")
-    print(f"  1. uv run finetune.py --train-data {run_dir}/data/train --val-data {run_dir}/data/val --output-dir {run_dir}/adapter")
-    print(f"  2. uv run rebuild_attr_query.py")
-    print(f"  3. uv run score.py --manifest {run_dir}/manifest.json --adapter-path {run_dir}/adapter")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--smoke-test", action="store_true",
+                        help="Tiny sizes for end-to-end pipeline validation.")
+    parser.add_argument("--run-dir", type=str, default=None)
+    args = parser.parse_args()
+
+    cfg = dict(SMOKE_CONFIG if args.smoke_test else CONFIG)
+    if args.run_dir:
+        cfg["run_dir"] = args.run_dir
+    run(cfg)
 
 
 if __name__ == "__main__":

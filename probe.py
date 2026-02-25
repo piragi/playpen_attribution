@@ -40,18 +40,19 @@ from pipeline_common import (
 ensure_hf_home_env()
 
 CONFIG = {
-    "manifest_path": "runs/smoltalk_v4/manifest.json",
-    "output_dir": "runs/smoltalk_v4/probe",
+    "run_dir": "runs/smoltalk_v4",
     # One probe is trained per entry; embeddings are extracted once and reused.
+    # scores_dir defaults to {run_dir}/scores when not set.
     "probes": [
-        {"name": "math_da", "scores_dir": "runs/smoltalk_v4/scores_math_da"},
+        {"name": "math_da"},
     ],
+    "score_output_dir": "runs/smoltalk_v4/scores_math_da",
     "extraction_layer": 17,
-    "adapter_path": None,   # set to extract from adapter instead of base model
+    "probe_adapter_path": None,   # set to extract from adapter instead of base model
     "ridge_alpha": 100.0,
     "val_frac": 0.20,
     "seed": 42,
-    "batch_size": 64,
+    "probe_batch_size": 64,
 }
 
 
@@ -146,27 +147,30 @@ def fit_probe(embeddings, scores_y, cfg, probe_name, out_dir, base_model) -> Non
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-def main() -> None:
-    cfg = CONFIG
-    np.random.seed(cfg["seed"])
+def run(cfg: dict) -> None:
+    run_dir = Path(cfg["run_dir"])
+    np.random.seed(cfg.get("seed", 42))
 
     device, dtype = resolve_device_dtype()
     print(f"Device: {device}, dtype: {dtype}")
 
-    manifest = json.loads(Path(cfg["manifest_path"]).read_text())
+    manifest = json.loads((run_dir / "manifest.json").read_text())
     base_model = manifest["base_model"]
 
     pool_ds = load_from_disk(str(Path(manifest["splits"]["score_pool"]["path"])))
     print(f"Pool: {len(pool_ds):,} examples")
 
-    out_dir = Path(cfg["output_dir"])
+    out_dir = run_dir / "probe"
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    adapter_path = cfg.get("probe_adapter_path")
+    extraction_layer = cfg.get("extraction_layer", 17)
 
     # Extract embeddings once, reuse for all probes.
     # Cache is keyed by (base_model, adapter_path, layer) so stale caches are
     # avoided when you change the embedding source.
     fingerprint = hashlib.sha1(
-        f"{base_model}|{cfg.get('adapter_path')}|{cfg['extraction_layer']}".encode()
+        f"{base_model}|{adapter_path}|{extraction_layer}".encode()
     ).hexdigest()[:8]
     emb_path = out_dir / f"pool_embeddings_{fingerprint}.npy"
 
@@ -175,10 +179,10 @@ def main() -> None:
         embeddings = np.load(str(emb_path))
     else:
         model, captured = load_model_with_hook(
-            base_model, cfg.get("adapter_path"), cfg["extraction_layer"], dtype, device
+            base_model, adapter_path, extraction_layer, dtype, device
         )
         print(f"\nExtracting residual stream embeddings ...")
-        embeddings = extract_embeddings(pool_ds, model, captured, device, cfg["batch_size"])
+        embeddings = extract_embeddings(pool_ds, model, captured, device, cfg.get("probe_batch_size", 64))
         del model
         if device == "cuda":
             torch.cuda.empty_cache()
@@ -187,13 +191,17 @@ def main() -> None:
 
     print(f"Embeddings: {embeddings.shape}  (dtype={embeddings.dtype})")
 
-    # Train one probe per entry in CONFIG['probes'].
-    for spec in cfg["probes"]:
-        scores_y = load_scores(spec["scores_dir"], len(pool_ds))
+    # Default scores_dir falls back to cfg["score_output_dir"].
+    default_scores_dir = cfg.get("score_output_dir") or str(run_dir / "scores")
+    for spec in cfg.get("probes", []):
+        scores_dir = spec.get("scores_dir") or default_scores_dir
+        scores_y = load_scores(scores_dir, len(pool_ds))
         print(f"\nScores [{spec['name']}]: range [{scores_y.min():.4f}, {scores_y.max():.4f}]  mean={scores_y.mean():.4f}")
         fit_probe(embeddings, scores_y, cfg, spec["name"], out_dir, base_model)
 
-    print("\nNext: uv run generate_continued_dataset.py")
+
+def main() -> None:
+    run(CONFIG)
 
 
 if __name__ == "__main__":

@@ -15,6 +15,7 @@ Run AFTER probe.py:
 """
 from __future__ import annotations
 
+import gc
 import json
 import pickle
 from pathlib import Path
@@ -38,19 +39,18 @@ from pipeline_common import (
 ensure_hf_home_env()
 
 CONFIG = {
-    "manifest_path": "runs/smoltalk_v4/manifest.json",
-    "probe_dir": "runs/smoltalk_v4/probe",
+    "run_dir": "runs/smoltalk_v4",
+    # probe filenames default to probe_{name}.pkl when not set
     "probes": [
-        {"name": "math_da", "filename": "probe_math_da.pkl"},
+        {"name": "math_da"},
     ],
-    "output_dir": "runs/smoltalk_v4/continuation",
     "extraction_layer": 17,         # must match probe.py
-    "adapter_path": None,           # set to extract from adapter instead of base model
+    "gen_adapter_path": None,       # set to extract from adapter instead of base model
     "category_filter": {"math", "data-analysis"},
     "pool_size": 30_000,
     "quality_size": 10_000,         # rows in the full quality arm (and label arm)
     "random_size": 10_000,
-    "batch_size": 64,
+    "gen_batch_size": 64,
     "seed": 42,
 }
 
@@ -179,35 +179,38 @@ def _estimate_skip_rows(manifest: dict) -> int:
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-def main() -> None:
-    cfg = CONFIG
+def run(cfg: dict) -> None:
+    run_dir = Path(cfg["run_dir"])
     device, dtype = resolve_device_dtype()
-    manifest = json.loads(Path(cfg["manifest_path"]).read_text())
+    manifest = json.loads((run_dir / "manifest.json").read_text())
     base_model = manifest["base_model"]
 
-    # Load probes
+    probe_dir = run_dir / "probe"
     probes = []
     for spec in cfg["probes"]:
-        path = Path(cfg["probe_dir"]) / spec["filename"]
+        filename = spec.get("filename") or f"probe_{spec['name']}.pkl"
+        path = probe_dir / filename
         with path.open("rb") as f:
             probes.append({"name": spec["name"], "probe": pickle.load(f)})
     print(f"Loaded probes: {[p['name'] for p in probes]}")
 
-    # Load model + hook
     model, captured = load_model_with_hook(
-        base_model, cfg.get("adapter_path"), cfg["extraction_layer"], dtype, device
+        base_model, cfg.get("gen_adapter_path"), cfg.get("extraction_layer", 17), dtype, device
     )
 
-    # Stream SmolTalk and score every row with all probes
-    pool_rows, scores_matrix = stream_and_score(cfg, manifest, probes, model, captured, device)
+    # Override batch_size key for stream_and_score compatibility
+    stream_cfg = {**cfg, "batch_size": cfg.get("gen_batch_size", 64)}
+    pool_rows, scores_matrix = stream_and_score(stream_cfg, manifest, probes, model, captured, device)
     n_pool = len(pool_rows)
 
-    out_dir = Path(cfg["output_dir"])
+    del model
+    gc.collect()
+    if device == "cuda":
+        torch.cuda.empty_cache()
+
+    out_dir = run_dir / "continuation"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # ── Ablation arms ─────────────────────────────────────────────────────────
-    # Per probe: full quality arm + 50% quality arm.
-    # Shared: one uniform random baseline, one LLM-label control.
     arms: dict[str, dict] = {}
     all_quality_idx: set[int] = set()
 
@@ -222,19 +225,24 @@ def main() -> None:
         arms[f"quality_{name}"]       = save_arm(pool_rows, quality_idx,    out_dir, f"quality_{name}")
         arms[f"quality_{name}_50pct"] = save_arm(pool_rows, quality_50_idx, out_dir, f"quality_{name}_50pct")
 
-    random_idx = select_random(cfg["random_size"], all_quality_idx, n_pool, cfg["seed"])
+    random_idx = select_random(cfg.get("random_size", 10_000), all_quality_idx, n_pool, cfg.get("seed", 42))
     arms["random"] = save_arm(pool_rows, random_idx, out_dir, "random")
+
+    random_50_idx = select_random(cfg.get("random_size", 10_000) // 2, all_quality_idx, n_pool, cfg.get("seed", 42))
+    arms["random_50pct"] = save_arm(pool_rows, random_50_idx, out_dir, "random_50pct")
 
     label_idx = select_label(pool_rows, {"good", "excellent"}, cfg["quality_size"])
     arms["label_good_excellent"] = save_arm(pool_rows, label_idx, out_dir, "label_good_excellent")
 
-    # ── Manifest ──────────────────────────────────────────────────────────────
+    label_50_idx = select_label(pool_rows, {"good", "excellent"}, cfg["quality_size"] // 2)
+    arms["label_good_excellent_50pct"] = save_arm(pool_rows, label_50_idx, out_dir, "label_good_excellent_50pct")
+
     cont_manifest = {
         "base_model": base_model,
         "max_length": manifest["max_length"],
-        "extraction_layer": cfg["extraction_layer"],
+        "extraction_layer": cfg.get("extraction_layer", 17),
         "probes": [
-            {"name": s["name"], "path": str(Path(cfg["probe_dir"]) / s["filename"])}
+            {"name": s["name"], "path": str(probe_dir / (s.get("filename") or f"probe_{s['name']}.pkl"))}
             for s in cfg["probes"]
         ],
         "pool_size": n_pool,
@@ -244,14 +252,9 @@ def main() -> None:
     cont_path.write_text(json.dumps(cont_manifest, indent=2))
     print(f"\nManifest → {cont_path}")
 
-    val_data = manifest["splits"]["val"]["path"]
-    run_dir  = str(Path(cfg["manifest_path"]).parent)
-    print("\nNext steps:")
-    for arm_name, arm_info in arms.items():
-        print(f"  uv run finetune.py --base-model {base_model} "
-              f"--train-data {arm_info['path']} "
-              f"--val-data {val_data} "
-              f"--output-dir {run_dir}/adapter_{arm_name}")
+
+def main() -> None:
+    run(CONFIG)
 
 
 if __name__ == "__main__":
