@@ -166,37 +166,45 @@ def main() -> None:
     probe.run(cfg)
     _clear_gpu()
 
-    print("\n=== 6) generate_continued_dataset ===")
-    finetune_seed = cfg.get("finetune_seed") or cfg["seed"]
-    generate_continued_dataset.run({**cfg, "seed": finetune_seed})
-    _clear_gpu()
-
-    print("\n=== 7) finetune continuation arms ===")
-    cont_manifest = json.loads((run_dir / "continuation" / "continuation_manifest.json").read_text())
+    seed_cfg = cfg.get("finetune_seed")
+    finetune_seeds = (
+        seed_cfg if isinstance(seed_cfg, list)
+        else [cfg["seed"]] if seed_cfg is None
+        else [seed_cfg]
+    )
     val_data = json.loads((run_dir / "manifest.json").read_text())["splits"]["val"]["path"]
-    seed_tag = f"_s{finetune_seed}" if cfg.get("finetune_seed") is not None else ""
-    for arm_name, arm_info in cont_manifest["arms"].items():
-        print(f"\n  --- arm: {arm_name} ---")
-        finetune.run({
-            **cfg,
-            "seed": finetune_seed,
-            "train_data": arm_info["path"],
-            "val_data": val_data,
-            "output_dir": str(run_dir / f"adapter_{arm_name}{seed_tag}"),
-        })
+
+    for finetune_seed in finetune_seeds:
+        seed_tag = f"_s{finetune_seed}" if seed_cfg is not None else ""
+
+        print(f"\n=== 6) generate_continued_dataset (seed={finetune_seed}) ===")
+        generate_continued_dataset.run({**cfg, "seed": finetune_seed})
         _clear_gpu()
 
-    print("\n=== 8) eval continuation arms ===")
-    if cfg["run_eval"]:
-        eval_dir = run_dir / "evals"
-        eval_dir.mkdir(parents=True, exist_ok=True)
-        for arm_name in cont_manifest["arms"]:
-            eval_harness.run({
+        print(f"\n=== 7) finetune continuation arms (seed={finetune_seed}) ===")
+        cont_manifest = json.loads((run_dir / "continuation" / "continuation_manifest.json").read_text())
+        for arm_name, arm_info in cont_manifest["arms"].items():
+            print(f"\n  --- arm: {arm_name} ---")
+            finetune.run({
                 **cfg,
-                "adapter_path": str(run_dir / f"adapter_{arm_name}{seed_tag}"),
-                "output_json": str(eval_dir / f"{arm_name}{seed_tag}.json"),
-                "apply_chat_template": True,
+                "seed": finetune_seed,
+                "train_data": arm_info["path"],
+                "val_data": val_data,
+                "output_dir": str(run_dir / f"adapter_{arm_name}{seed_tag}"),
             })
+            _clear_gpu()
+
+        print(f"\n=== 8) eval continuation arms (seed={finetune_seed}) ===")
+        if cfg["run_eval"]:
+            eval_dir = run_dir / "evals"
+            eval_dir.mkdir(parents=True, exist_ok=True)
+            for arm_name in cont_manifest["arms"]:
+                eval_harness.run({
+                    **cfg,
+                    "adapter_path": str(run_dir / f"adapter_{arm_name}{seed_tag}"),
+                    "output_json": str(eval_dir / f"{arm_name}{seed_tag}.json"),
+                    "apply_chat_template": True,
+                })
 
     print("\nDone.")
 
