@@ -23,6 +23,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from datasets import Dataset, load_dataset
+from tqdm.auto import tqdm
 
 from pipeline_common import (
     ensure_hf_home_env,
@@ -92,19 +93,31 @@ def stream_and_score(cfg, manifest, probes, model, captured, device) -> tuple[li
     pool_rows: list[dict] = []
     all_scores: list[list[float]] = []
     buffer: list[dict] = []
+    skip_pbar = tqdm(total=skip_rows, desc="Skip raw rows", unit="row") if skip_rows > 0 else None
+    score_pbar = tqdm(total=cfg.get("pool_size"), desc="Score kept rows", unit="row")
 
     def flush() -> None:
+        n = len(buffer)
+        scored_before = len(pool_rows)
         scores = score_batch(buffer, probes, model, captured, device)
         pool_rows.extend(buffer)
         all_scores.extend(scores.tolist())
         buffer.clear()
+        if cfg.get("pool_size"):
+            remaining = max(0, cfg["pool_size"] - scored_before)
+            score_pbar.update(min(n, remaining))
+        else:
+            score_pbar.update(n)
 
     print(f"Streaming {manifest['dataset']}, skipping {skip_rows:,} rows ...")
     for i, row in enumerate(raw):
         if i < skip_rows:
-            if i > 0 and i % 50_000 == 0:
-                print(f"  skipping... {i:,}/{skip_rows:,}", flush=True)
+            if skip_pbar is not None:
+                skip_pbar.update(1)
             continue
+        if skip_pbar is not None:
+            skip_pbar.close()
+            skip_pbar = None
         if category_filter and row.get("category", "") not in category_filter:
             continue
         messages = row.get("messages") or row.get("conversations") or []
@@ -117,14 +130,14 @@ def stream_and_score(cfg, manifest, probes, model, captured, device) -> tuple[li
         buffer.append(tok)
         if len(buffer) >= cfg["batch_size"]:
             flush()
-            if len(pool_rows) % 5_000 == 0:
-                limit_str = f"{cfg['pool_size']:,}" if cfg.get("pool_size") else "∞"
-                print(f"  scored {len(pool_rows):,}/{limit_str}", flush=True)
         if cfg.get("pool_size") and len(pool_rows) >= cfg["pool_size"]:
             break
 
     if buffer:
         flush()
+    if skip_pbar is not None:
+        skip_pbar.close()
+    score_pbar.close()
 
     pool_rows = pool_rows[:cfg.get("pool_size")]
     scores    = np.array(all_scores[:cfg.get("pool_size")], dtype=np.float32)
