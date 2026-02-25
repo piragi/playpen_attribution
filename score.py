@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import json
 import shutil
-from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -245,101 +244,6 @@ def write_summary(rows: list[dict], out_path: Path) -> None:
     out_path.write_text(json.dumps(summary, indent=2))
 
 
-def compute_length_bins(lengths: np.ndarray, bins: int = 5) -> np.ndarray:
-    edges = np.unique(np.quantile(lengths, np.linspace(0.0, 1.0, bins + 1)))
-    if len(edges) <= 2:
-        return np.zeros_like(lengths, dtype=np.int32)
-    return np.searchsorted(edges[1:-1], lengths, side="right").astype(np.int32)
-
-
-def build_subsets(
-    pool_ds: Dataset,
-    score_data_ds: Dataset,
-    scores: np.ndarray,
-    out_dir: Path,
-    k: int,
-    seed: int,
-    allow_random_overlap: bool,
-) -> dict:
-    n = len(pool_ds)
-    k = max(1, min(k, n))
-
-    ranked = np.argsort(-scores)
-    top_idx = ranked[:k].astype(np.int32).tolist()
-    top_set = set(top_idx)
-    available = list(range(n)) if allow_random_overlap else [i for i in range(n) if i not in top_set]
-
-    rng = np.random.default_rng(seed)
-    lengths = (
-        np.asarray(score_data_ds["length"], dtype=np.float32)
-        if "length" in score_data_ds.column_names
-        else np.zeros(n, dtype=np.float32)
-    )
-    length_bins = compute_length_bins(lengths)
-
-    # Stratify random baseline by length bin only (seq_len is the dominant
-    # confound in attribution scores, so we control for it explicitly).
-    top_strata = Counter(int(length_bins[i]) for i in top_idx)
-    remaining = set(available)
-    random_idx: list[int] = []
-
-    for length_bin, target_count in top_strata.items():
-        bin_pool = [i for i in remaining if int(length_bins[i]) == length_bin]
-        take = min(target_count, len(bin_pool))
-        if take > 0:
-            chosen = rng.choice(bin_pool, size=take, replace=False).tolist()
-            random_idx.extend(int(i) for i in chosen)
-            for i in chosen:
-                remaining.remove(int(i))
-
-    # Fill any remaining slots uniformly at random
-    if len(random_idx) < k:
-        pool = list(remaining)
-        need = min(k - len(random_idx), len(pool))
-        if need > 0:
-            chosen = rng.choice(pool, size=need, replace=False).tolist()
-            random_idx.extend(int(i) for i in chosen)
-
-    if len(random_idx) > k:
-        random_idx = random_idx[:k]
-
-    top_dir = out_dir / "top_k"
-    rand_dir = out_dir / "matched_random_k"
-    for p in (top_dir, rand_dir):
-        if p.exists():
-            remove_path(p)
-
-    pool_ds.select(sorted(top_idx)).save_to_disk(str(top_dir))
-    pool_ds.select(sorted(random_idx)).save_to_disk(str(rand_dir))
-
-    top_tokens = int(lengths[top_idx].sum()) if len(lengths) else 0
-    rand_tokens = int(lengths[random_idx].sum()) if len(lengths) else 0
-    overlap_rows = int(len(set(top_idx).intersection(set(random_idx))))
-
-    payload = {
-        "k": int(k),
-        "seed": int(seed),
-        "allow_random_overlap": bool(allow_random_overlap),
-        "arms": {
-            "top_k": {
-                "path": str(top_dir),
-                "rows": int(len(top_idx)),
-                "token_count": top_tokens,
-            },
-            "matched_random_k": {
-                "path": str(rand_dir),
-                "rows": int(len(random_idx)),
-                "token_count": rand_tokens,
-            },
-        },
-        "token_budget_delta": abs(top_tokens - rand_tokens),
-        "overlap_rows": overlap_rows,
-    }
-
-    (out_dir / "subset_manifest.json").write_text(json.dumps(payload, indent=2))
-    return payload
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description="Minimal Bergson scoring pipeline.")
     parser.add_argument("--manifest", type=str, default="runs/smoltalk_v4/manifest.json")
@@ -358,15 +262,6 @@ def main() -> None:
     parser.add_argument("--no-unit-normalize", dest="unit_normalize", action="store_false")
     parser.add_argument("--loss-reduction", choices=["mean", "sum"], default="mean")
     parser.add_argument("--label-smoothing", type=float, default=0.0)
-    parser.add_argument("--subset-k", type=int, default=256)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--allow-random-overlap", action="store_true")
-    parser.add_argument(
-        "--postprocess-only",
-        action="store_true",
-        default=False,
-        help="Skip cleanup and gradient/score computation; re-run diagnostics/subsets on existing scores.",
-    )
     parser.set_defaults(unit_normalize=True)
     args = parser.parse_args()
 
@@ -380,50 +275,46 @@ def main() -> None:
     score_run = out / "train_scores"
     diagnostics_path = out / "row_diagnostics.jsonl"
     summary_path = out / "summary.json"
-    subsets_dir = out / "subsets"
+    to_clean = [
+        query_run,
+        part_path(query_run),
+        score_run,
+        part_path(score_run),
+        diagnostics_path,
+        summary_path,
+    ]
+    if args.preconditioning_mode == "mixed":
+        to_clean.extend([pool_pre, part_path(pool_pre)])
+    for p in to_clean:
+        if p.exists():
+            remove_path(p)
 
-    if not args.postprocess_only:
-        to_clean = [
-            query_run,
-            part_path(query_run),
-            score_run,
-            part_path(score_run),
-            diagnostics_path,
-            summary_path,
-            subsets_dir,
-        ]
-        if args.preconditioning_mode == "mixed":
-            to_clean.extend([pool_pre, part_path(pool_pre)])
-        for p in to_clean:
-            if p.exists():
-                remove_path(p)
+    # Resolve the effective model handle: adapter if given, else the base model ID.
+    # Overwrite args.adapter_path so downstream config uses one value consistently.
+    if args.adapter_path:
+        ensure_adapter_config(Path(args.adapter_path), args.base_model)
+    else:
+        # No adapter: use the base model ID directly.
+        # Do NOT call ensure_adapter_config — it would create a local stub directory
+        # with only config.json and no tokenizer files, causing tokenizer load failures.
+        args.adapter_path = args.base_model
 
-        # Resolve the effective model handle: adapter if given, else the base model ID.
-        # Overwrite args.adapter_path so downstream config uses one value consistently.
-        if args.adapter_path:
-            ensure_adapter_config(Path(args.adapter_path), args.base_model)
-        else:
-            # No adapter: use the base model ID directly.
-            # Do NOT call ensure_adapter_config — it would create a local stub directory
-            # with only config.json and no tokenizer files, causing tokenizer load failures.
-            args.adapter_path = args.base_model
+    use_query_pre = args.preconditioning_mode in {"query", "mixed"}
+    if args.score_mode == "nearest":
+        run_build(query_source, query_run, args, compute_preconditioners=use_query_pre)
+    else:
+        run_reduce(query_source, query_run, args, compute_preconditioners=use_query_pre)
 
-        use_query_pre = args.preconditioning_mode in {"query", "mixed"}
-        if args.score_mode == "nearest":
-            run_build(query_source, query_run, args, compute_preconditioners=use_query_pre)
-        else:
-            run_reduce(query_source, query_run, args, compute_preconditioners=use_query_pre)
+    if args.preconditioning_mode == "mixed":
+        run_reduce(pool_source, pool_pre, args, compute_preconditioners=True)
 
-        if args.preconditioning_mode == "mixed":
-            run_reduce(pool_source, pool_pre, args, compute_preconditioners=True)
-
-        run_score(
-            pool_path=pool_source,
-            query_run=query_run,
-            pool_preconditioner_run=pool_pre if args.preconditioning_mode == "mixed" else None,
-            score_run=score_run,
-            args=args,
-        )
+    run_score(
+        pool_path=pool_source,
+        query_run=query_run,
+        pool_preconditioner_run=pool_pre if args.preconditioning_mode == "mixed" else None,
+        score_run=score_run,
+        args=args,
+    )
 
     scores = get_score_vector(score_run, args.score_mode)
     pool_ds = load_from_disk(str(pool_source))
@@ -431,33 +322,9 @@ def main() -> None:
 
     rows = write_row_diagnostics(pool_ds, score_data_ds, scores, diagnostics_path)
     write_summary(rows, summary_path)
-    subsets_dir.mkdir(parents=True, exist_ok=True)
-    subset_payload = build_subsets(
-        pool_ds=pool_ds,
-        score_data_ds=score_data_ds,
-        scores=scores,
-        out_dir=subsets_dir,
-        k=args.subset_k,
-        seed=args.seed,
-        allow_random_overlap=args.allow_random_overlap,
-    )
-
-    continuation_manifest = {
-        **manifest,
-        "splits": {
-            **manifest.get("splits", {}),
-            "top_k": subset_payload["arms"]["top_k"],
-            "matched_random_k": subset_payload["arms"]["matched_random_k"],
-        },
-    }
-
-    continuation_path = out / "continuation_manifest.json"
-    continuation_path.write_text(json.dumps(continuation_manifest, indent=2))
 
     print(f"row diagnostics: {diagnostics_path}")
     print(f"summary:         {summary_path}")
-    print(f"subset manifest: {subsets_dir / 'subset_manifest.json'}")
-    print(f"continue manifest: {continuation_path}")
 
 
 if __name__ == "__main__":

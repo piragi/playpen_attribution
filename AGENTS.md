@@ -1,6 +1,6 @@
 # Playpen Attribution — Design Rationale & Findings
 
-Last updated: 2026-02-23
+Last updated: 2026-02-25
 
 ---
 
@@ -13,8 +13,8 @@ The pipeline:
 2. **Finetune scoring adapter**: LoRA SFT on train split → adapter used by Bergson attribution.
 3. **Attribution**: Bergson scores each pool example by influence toward a high-quality attr_query (smol-magpie-ultra, good/excellent, math+DA, disjoint from pool).
 4. **Probe**: Fit Ridge Regression on layer-17 residual stream embeddings of the scored pool → predict attribution scores.
-5. **Generate continuation datasets**: Apply probe to 30k new smol-magpie-ultra rows → select top-10k quality reference + scaled quality subsets (default: 80%, 50%) + two random baselines (token-matched, token+category-matched, fixed at 10k rows).
-6. **Finetune arms from base**: quality reference/scales + both random baselines.
+5. **Generate continuation datasets**: Apply probe to 30k new smol-magpie-ultra rows → select top-10k quality reference + fixed 50% quality subset + uniform random baseline + label-only baseline.
+6. **Finetune arms from base**: quality reference/subset + random + label-only baseline.
 7. **Eval**: ARC, HellaSwag, WinoGrande, IFEval, GSM8K — compare all arms.
 
 Core claim: **Residual stream probing makes data attribution scalable** — one forward pass + linear probe replaces expensive per-example attribution at inference time.
@@ -89,7 +89,7 @@ Why provisional:
 - v4 historical baseline also had category-mix mismatch (quality was more math-heavy), which can directly affect GSM8K.
 - Result is currently a single-run comparison; no seed-robust confidence interval yet.
 
-Interpretation: treat v4 as a strong signal worth pursuing. The pipeline now emits matched random baselines (token and token+category), and these reruns are required before concluding the probe itself is the primary cause of the gain.
+Interpretation: treat v4 as a strong signal worth pursuing. The current pipeline emits a uniform-random baseline plus a label-only baseline as controls.
 
 ---
 
@@ -102,7 +102,7 @@ Interpretation: treat v4 as a strong signal worth pursuing. The pipeline now emi
 | `finetune.py` | LoRA SFT on pre-tokenized data; saves IT tokenizer alongside adapter. |
 | `score.py` | Bergson gradient-based attribution; pool vs attr_query; supports PEFT adapters. Pool is the training data. |
 | `probe.py` | Extract layer-17 residual stream from pool → fit Ridge probe to attribution scores. Caches embeddings to avoid re-extraction. |
-| `generate_continued_dataset.py` | Score new smol-magpie-ultra rows with probe → quality reference (top-N), optional scaled quality subsets, two fixed-size random baselines (token-matched, token+category-matched), and optional label-only baselines from SmolTalk quality labels. |
+| `generate_continued_dataset.py` | Score new smol-magpie-ultra rows with probe → quality reference (top-N), fixed 50% quality subset, uniform random baseline, and label-only baseline from SmolTalk quality labels. |
 | `eval_harness.py` | lm-eval benchmark evaluation (ARC, HellaSwag, WinoGrande, IFEval, GSM8K). |
 | `vram.py` | VRAM profiler for SmolLM2-1.7B. |
 
@@ -115,7 +115,7 @@ build_sft_data.py
   → score.py (pool = train split)
   → probe.py  ← check R² here before proceeding; target R² > 0.5
   → generate_continued_dataset.py
-  → finetune.py (quality arm + matched random baselines)
+  → finetune.py (quality arms + random + label baseline)
   → eval_harness.py (all arms)
 ```
 
@@ -154,13 +154,11 @@ At alpha=1.0 the probe receives an ill-conditioned matrix warning (rcond ≈ 1e-
 
 The continuation pool (generate_continued_dataset.py) is filtered to the same categories as the attribution query (math + data-analysis). This is intentional: the probe was trained to predict scores under a math+DA query, so it will correctly rank math+DA examples. Applying it to unrelated categories (e.g. creative writing) would produce meaningless scores.
 
-### Matched random baselines
+### Current baselines
 
-`generate_continued_dataset.py` now emits two controlled random baselines per quality arm:
-- `random_token_match`: same row count, random draw from the quality-excluded remainder, then simple token-increase swaps if the draw is below the quality token budget.
-- `random_token_cat_match`: same row count and same category proportions as quality, with category-preserving token-increase swaps if needed.
-
-Both baselines are drawn from the quality-excluded remainder. If an exact `>= target tokens` match is impossible, the script records this in `continuation_manifest.json` (`met_target_tokens=false`, `max_possible_tokens=<...>`).
+`generate_continued_dataset.py` emits two controls:
+- `random`: uniform random rows from the quality-excluded remainder.
+- `label_good_excellent`: rows ranked by SmolTalk quality label (`excellent > good`).
 
 ---
 
@@ -168,9 +166,7 @@ Both baselines are drawn from the quality-excluded remainder. If an exact `>= ta
 
 ### Tokenizer must match model
 
-The attr_query tokenizer bug burned time: `rebuild_attr_query.py` previously derived the tokenizer from a fallback model when `tokenizer_model` was missing in the manifest. With SmolLM2 this can produce out-of-vocab token IDs and fail with CUDA index assertions.
-
-Fix: read `manifest.get("tokenizer_model")` first, and if absent derive tokenizer from `base_model + "-Instruct"` (for SmolLM2).
+Always load the instruct tokenizer derived from the base model (`base_model + "-Instruct"` for SmolLM2). `pipeline_common.load_tokenizer(...)` enforces this across scripts.
 
 ### ensure_adapter_config writes the wrong model config
 
@@ -191,8 +187,7 @@ Scripts now pass model IDs directly to `from_pretrained(...)` and rely on the Hu
 
 ### Probe/continuation embedding source must match
 
-`probe.py` now supports `embedding_source_mode={"base","adapter"}` and writes the resolved source into `probe_meta_<name>.json`.
-`generate_continued_dataset.py` defaults to `embedding_source_mode="probe_meta"` so continuation scoring uses the same representation source as probe training. If these diverge, probe rankings can degrade due to representation mismatch.
+`probe.py` and `generate_continued_dataset.py` both expose `adapter_path` for residual extraction source. Keep these aligned (`None`/`None` or same adapter) to avoid representation mismatch.
 
 ### Attention implementation
 
@@ -249,7 +244,7 @@ uv run eval_harness.py \
 | `pooling` | Last response token | Captures final response representation |
 | `ridge_alpha` | 100.0 | Avoids ill-conditioning of 2048-dim features |
 | `val_frac` | 0.20 | Standard held-out fraction |
-| `embedding_source_mode` | `base` (or `adapter`) | Ablation switch: extract probe embeddings from base or LoRA-adapted model |
+| `adapter_path` | `None` (or adapter dir) | Optional: extract probe embeddings from LoRA-adapted model |
 
 ### generate_continued_dataset.py
 
@@ -258,10 +253,10 @@ uv run eval_harness.py \
 | `category_filter` | `{"math", "data-analysis"}` |
 | `pool_size` | 30,000 |
 | `quality_size` | 10,000 |
-| `quality_scales` | `[1.0, 0.8, 0.5]` |
 | `random_size` | 10,000 |
-| `label_arms` | `[{"name": "label_good_excellent", "qualities": {"good","excellent"}, "size": null, "token_match_probe": null}]` | Ranks label candidates (`excellent > good`, then Magpie score), keeps up to requested size, and if fewer exist keeps all available (shortfall logged). |
-| `embedding_source_mode` | `probe_meta` | Reuse the same embedding source recorded by probe metadata for representation consistency |
+| `adapter_path` | `None` (or adapter dir) |
+| `quality_50pct` | `quality_size // 2` (fixed) |
+| `label arm` | `label_good_excellent` (fixed: `{good, excellent}`) |
 
 ---
 
@@ -283,22 +278,18 @@ runs/smoltalk_v4/
     probe_meta_math_da.json
   continuation/
     quality_math_da/  10k rows — top-10k by probe score
-    quality_math_da_80pct/     8k rows — top-80% of quality reference
     quality_math_da_50pct/     5k rows — top-50% of quality reference
-    random_token_match/      10k rows — token-budget matched random baseline
-    random_token_cat_match/  10k rows — token+category matched random baseline
+    random/                 10k rows — uniform-random baseline
     label_good_excellent/    10k rows — label-only baseline (SmolTalk quality in {good, excellent})
   adapter_quality_math_da/
-  adapter_quality_math_da_80pct/
   adapter_quality_math_da_50pct/
-  adapter_random_token_match/
-  adapter_random_token_cat_match/
+  adapter_random/
+  adapter_label_good_excellent/
   evals/
     quality_math_da.json        ← GSM8K: 0.2161
-    quality_math_da_80pct.json
     quality_math_da_50pct.json
-    random_token_match.json
-    random_token_cat_match.json
+    random.json
+    label_good_excellent.json
 ```
 
 ---
@@ -315,7 +306,7 @@ runs/smoltalk_v4/
 
 5. **Selection rate sensitivity**: Quality arm = top-10k of 30k (33%). What happens at top-5k (17%) — does tighter selection improve GSM8K further or hurt coverage?
 
-6. **Unmatched random ablation?** In addition to matched random baselines, do we also want a pure uniform-random arm (no token/category matching) as an intentionally weak baseline for context?
+6. **Matched random ablation?** Should we re-introduce token/category-matched random baselines to isolate probe signal from token-budget confounds?
 
 ---
 

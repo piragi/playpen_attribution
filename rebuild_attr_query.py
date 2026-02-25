@@ -53,7 +53,7 @@ def main() -> None:
         "--category",
         type=str,
         default=None,
-        choices=list(_CATEGORY_KEY.keys()) + ["all"],
+        choices=sorted(CONFIG["category_filter"]) + ["all"],
         help="Category to filter to. Omit or pass 'all' for no category filter.",
     )
     args = parser.parse_args()

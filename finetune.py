@@ -93,7 +93,6 @@ def run_train(args: argparse.Namespace) -> None:
         model = PeftModel.from_pretrained(
             base, args.resume_adapter, is_trainable=True, autocast_adapter_dtype=False
         )
-        tokenizer_source = args.resume_adapter
     else:
         lora_cfg = LoraConfig(
             r=args.lora_r,
@@ -103,7 +102,6 @@ def run_train(args: argparse.Namespace) -> None:
             task_type="CAUSAL_LM",
         )
         model = get_peft_model(base, lora_cfg)
-        tokenizer_source = args.base_model
 
     model.enable_input_require_grads()
     model.print_trainable_parameters()
@@ -227,7 +225,6 @@ def _add_train_args(p: argparse.ArgumentParser) -> None:
 
 
 def main() -> None:
-    import sys
     if len(sys.argv) > 1 and sys.argv[1] == "merge":
         parser = argparse.ArgumentParser(description="Merge LoRA adapter into base model.")
         parser.add_argument("--adapter-path", required=True)
