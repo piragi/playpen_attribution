@@ -6,6 +6,8 @@ from pathlib import Path
 from typing import Any, Sequence
 
 import torch
+from peft import PeftModel
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 HF_HOME_DEFAULT = str(Path.home() / ".cache" / "huggingface")
 DEFAULT_BASE_MODEL = "HuggingFaceTB/SmolLM2-1.7B"
@@ -28,17 +30,11 @@ def infer_instruct_tokenizer_model(base_model: str) -> str:
     return base_model + "-Instruct"
 
 
-def resolve_device_dtype(device_arg: str) -> tuple[str, torch.dtype]:
-    """Resolve a device string and preferred dtype for model loading."""
-    if device_arg == "auto":
-        if torch.cuda.is_available():
-            dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-            return "cuda", dtype
-        return "cpu", torch.float32
-    if device_arg == "cuda":
-        dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-        return "cuda", dtype
-    return device_arg, torch.float32
+def resolve_device_dtype() -> tuple[str, torch.dtype]:
+    """Return (device, dtype) based on what's available."""
+    if torch.cuda.is_available():
+        return "cuda", torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    return "cpu", torch.float32
 
 
 def pad_tokenized_batch(
@@ -77,25 +73,102 @@ def pool_hidden_at_positions(hidden: torch.Tensor, positions: torch.Tensor) -> t
     return hidden.gather(dim=1, index=idx).squeeze(1)
 
 
+def load_tokenizer(base_model: str) -> AutoTokenizer:
+    """Load the instruct tokenizer for a base model, setting pad_token if needed."""
+    tokenizer = AutoTokenizer.from_pretrained(infer_instruct_tokenizer_model(base_model))
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    return tokenizer
+
+
+def load_model_with_hook(
+    base_model: str,
+    adapter_path: str | None,
+    extraction_layer: int,
+    dtype: torch.dtype,
+    device: str,
+) -> tuple[Any, dict]:
+    """Load a CausalLM with optional PEFT adapter and register a residual stream hook.
+
+    The hook captures the output of transformer layer `extraction_layer` into
+    captured['acts'] on every forward pass. For decoder-only models, pooling
+    the last response token from this hidden state is the standard reward-model
+    pooling strategy (identical to InstructGPT-style scoring heads).
+
+    Returns (model, captured).
+    """
+    captured: dict[str, torch.Tensor] = {}
+
+    def _hook(_m: Any, _i: Any, out: Any) -> None:
+        captured["acts"] = out[0] if isinstance(out, tuple) else out
+
+    base = AutoModelForCausalLM.from_pretrained(
+        base_model, torch_dtype=dtype, device_map=device, attn_implementation=ATTN_IMPLEMENTATION
+    )
+    if adapter_path:
+        model = PeftModel.from_pretrained(base, adapter_path, is_trainable=False, autocast_adapter_dtype=False)
+    else:
+        model = base
+    model.eval()
+    model.config.use_cache = False
+    get_transformer_layers_for_hook(model)[extraction_layer].register_forward_hook(_hook)
+    print(f"Loaded {'adapter' if adapter_path else 'base'} model, hook at layer {extraction_layer}")
+    return model, captured
+
+
+def mask_prompt(
+    messages: list[dict],
+    tokenizer: Any,
+    max_length: int,
+) -> dict | None:
+    """Tokenize a conversation with prompt tokens masked to -100 in labels.
+
+    Only assistant turn tokens are supervised; all other tokens are masked.
+    Returns {"input_ids", "labels", "length"} or None if too long or empty.
+    """
+    full_ids = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=False)
+    if len(full_ids) > max_length:
+        return None
+    labels = [-100] * len(full_ids)
+    for i, msg in enumerate(messages):
+        if msg["role"] != "assistant":
+            continue
+        start = len(tokenizer.apply_chat_template(messages[:i], tokenize=True, add_generation_prompt=True))
+        end = min(
+            len(tokenizer.apply_chat_template(messages[:i + 1], tokenize=True, add_generation_prompt=False)),
+            len(full_ids),
+        )
+        labels[start:end] = full_ids[start:end]
+    if all(lbl == -100 for lbl in labels):
+        return None
+    return {"input_ids": full_ids, "labels": labels, "length": len(full_ids)}
+
+
+def get_magpie_score(row: dict) -> float:
+    """Extract Magpie quality score from a SmolTalk row."""
+    for key in ("score", "quality_score", "magpie_score"):
+        val = row.get(key)
+        if isinstance(val, (int, float)):
+            return float(val)
+    return 0.0
+
+
 def get_transformer_layers_for_hook(model: Any) -> Any:
     """Return the transformer layers container for base or PEFT-wrapped CausalLMs."""
-    candidate_paths = [
+    for path in [
         ("model", "layers"),
         ("base_model", "model", "model", "layers"),
         ("base_model", "model", "layers"),
         ("base_model", "layers"),
-    ]
-    for path in candidate_paths:
-        cur = model
-        ok = True
-        for attr in path:
-            if not hasattr(cur, attr):
-                ok = False
-                break
-            cur = getattr(cur, attr)
-        if ok:
+    ]:
+        try:
+            cur = model
+            for attr in path:
+                cur = getattr(cur, attr)
             return cur
+        except AttributeError:
+            continue
     raise AttributeError(
-        "Could not locate transformer layers on model for hook registration. "
+        "Could not locate transformer layers on model. "
         "Expected one of: model.layers / base_model.model.model.layers / base_model.model.layers."
     )

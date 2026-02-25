@@ -7,17 +7,15 @@ Data must already be tokenized with prompt tokens masked (labels = -100).
 This keeps training and attribution in sync — Bergson sees the same masking.
 
 Usage:
-    uv run finetune.py            # train with CONFIG defaults
-    uv run finetune.py --help
-
-Subcommands:
-    train   (default) Fine-tune and save adapter
-    merge   Merge adapter weights into base model and save full model
+    uv run finetune.py                      # train with CONFIG defaults
+    uv run finetune.py --train-data ...     # train with overrides
+    uv run finetune.py merge --adapter-path ...  # merge adapter into base
 """
 from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 import torch
@@ -30,6 +28,7 @@ from pipeline_common import (
     DEFAULT_BASE_MODEL,
     ensure_hf_home_env,
     infer_instruct_tokenizer_model,
+    resolve_device_dtype,
 )
 
 ensure_hf_home_env()
@@ -73,8 +72,7 @@ def run_train(args: argparse.Namespace) -> None:
     val_ds = load_from_disk(args.val_data) if args.val_data else None
 
     # Keep only the columns Trainer needs; drop magpie_score, length, etc.
-    keep = [c for c in ("input_ids", "labels") if c in train_ds.column_names]
-    train_ds = train_ds.select_columns(keep)
+    train_ds = train_ds.select_columns(["input_ids", "labels"])
 
     print(f"train rows: {len(train_ds):,}")
     # In-training eval is disabled to avoid large logits-memory spikes.
@@ -82,8 +80,7 @@ def run_train(args: argparse.Namespace) -> None:
     if val_ds is not None:
         print(f"val rows:   {len(val_ds):,} (not used for in-training eval)")
 
-    use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
-    dtype = torch.bfloat16 if use_bf16 else torch.float32
+    _, dtype = resolve_device_dtype()
 
     base = AutoModelForCausalLM.from_pretrained(
         args.base_model,
@@ -111,12 +108,10 @@ def run_train(args: argparse.Namespace) -> None:
     model.enable_input_require_grads()
     model.print_trainable_parameters()
 
-    # Always use the IT tokenizer for its chat template.
-    # If resuming from an adapter that already has the IT tokenizer saved, load from there.
-    # Otherwise derive IT tokenizer model name from base model.
-    it_model = infer_instruct_tokenizer_model(args.base_model)
-    it_tokenizer_source = tokenizer_source if args.resume_adapter else it_model
-    tokenizer = AutoTokenizer.from_pretrained(it_tokenizer_source)
+    # When resuming, load the IT tokenizer already saved alongside the adapter.
+    # Otherwise derive the IT model name from the base model.
+    tok_source = args.resume_adapter or infer_instruct_tokenizer_model(args.base_model)
+    tokenizer = AutoTokenizer.from_pretrained(tok_source)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
@@ -142,8 +137,8 @@ def run_train(args: argparse.Namespace) -> None:
         weight_decay=args.weight_decay,
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
-        bf16=use_bf16,
-        fp16=torch.cuda.is_available() and not use_bf16,
+        bf16=(dtype == torch.bfloat16),
+        fp16=(dtype == torch.float16),
         logging_steps=args.logging_steps,
         save_steps=args.save_steps,
         save_total_limit=args.save_total_limit,
@@ -189,8 +184,7 @@ def run_merge(args: argparse.Namespace) -> None:
     )
     out_dir = args.output_dir or f"{args.adapter_path.rstrip('/')}_merged"
 
-    use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
-    dtype = torch.bfloat16 if use_bf16 else torch.float32
+    _, dtype = resolve_device_dtype()
 
     base = AutoModelForCausalLM.from_pretrained(
         base_model, torch_dtype=dtype, attn_implementation=ATTN_IMPLEMENTATION
@@ -204,26 +198,6 @@ def run_merge(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
-
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="LoRA SFT on pre-tokenized data.")
-    sub = parser.add_subparsers(dest="command")
-
-    # Default: train (no subcommand needed)
-    train = sub.add_parser("train")
-    _add_train_args(train)
-
-    merge = sub.add_parser("merge")
-    merge.add_argument("--adapter-path", required=True)
-    merge.add_argument("--base-model", default=None)
-    merge.add_argument("--output-dir", default=None)
-
-    # Allow running without a subcommand (defaults to train with CONFIG)
-    parser.set_defaults(command="train")
-    _add_train_args(parser)
-
-    return parser
-
 
 def _add_train_args(p: argparse.ArgumentParser) -> None:
     c = CONFIG
@@ -253,11 +227,17 @@ def _add_train_args(p: argparse.ArgumentParser) -> None:
 
 
 def main() -> None:
-    args = build_parser().parse_args()
-    if args.command == "merge":
-        run_merge(args)
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "merge":
+        parser = argparse.ArgumentParser(description="Merge LoRA adapter into base model.")
+        parser.add_argument("--adapter-path", required=True)
+        parser.add_argument("--base-model", default=None)
+        parser.add_argument("--output-dir", default=None)
+        run_merge(parser.parse_args(sys.argv[2:]))
     else:
-        run_train(args)
+        parser = argparse.ArgumentParser(description="LoRA SFT on pre-tokenized data.")
+        _add_train_args(parser)
+        run_train(parser.parse_args())
 
 
 if __name__ == "__main__":

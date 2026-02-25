@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import shutil
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -199,17 +200,16 @@ def write_row_diagnostics(
         else np.zeros(len(pool_ds), dtype=np.float32)
     )
 
-    rows = []
-    for i in range(len(pool_ds)):
-        rows.append(
-            {
-                "index": int(i),
-                "score": float(scores[i]),
-                "magpie_score": float(magpie_scores[i]),
-                "length_tokens": int(lengths[i]),
-                "loss": float(losses[i]),
-            }
-        )
+    rows = [
+        {
+            "index": int(i),
+            "score": float(scores[i]),
+            "magpie_score": float(magpie_scores[i]),
+            "length_tokens": int(lengths[i]),
+            "loss": float(losses[i]),
+        }
+        for i in range(len(pool_ds))
+    ]
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with out_path.open("w") as f:
@@ -231,9 +231,9 @@ def write_summary(rows: list[dict], out_path: Path) -> None:
             "total": int(len(scores)),
         },
         "score_stats": {
-            "min": float(np.min(scores)) if len(scores) else 0.0,
-            "max": float(np.max(scores)) if len(scores) else 0.0,
-            "mean": float(np.mean(scores)) if len(scores) else 0.0,
+            "min": float(np.min(scores)),
+            "max": float(np.max(scores)),
+            "mean": float(np.mean(scores)),
         },
         "correlations": {
             "score_vs_length": safe_corr(scores, lengths),
@@ -279,7 +279,6 @@ def build_subsets(
 
     # Stratify random baseline by length bin only (seq_len is the dominant
     # confound in attribution scores, so we control for it explicitly).
-    from collections import Counter
     top_strata = Counter(int(length_bins[i]) for i in top_idx)
     remaining = set(available)
     random_idx: list[int] = []
@@ -409,20 +408,17 @@ def main() -> None:
             # with only config.json and no tokenizer files, causing tokenizer load failures.
             args.adapter_path = args.base_model
 
-        pool_path = pool_source
-        query_path = query_source
-
         use_query_pre = args.preconditioning_mode in {"query", "mixed"}
         if args.score_mode == "nearest":
-            run_build(query_path, query_run, args, compute_preconditioners=use_query_pre)
+            run_build(query_source, query_run, args, compute_preconditioners=use_query_pre)
         else:
-            run_reduce(query_path, query_run, args, compute_preconditioners=use_query_pre)
+            run_reduce(query_source, query_run, args, compute_preconditioners=use_query_pre)
 
         if args.preconditioning_mode == "mixed":
-            run_reduce(pool_path, pool_pre, args, compute_preconditioners=True)
+            run_reduce(pool_source, pool_pre, args, compute_preconditioners=True)
 
         run_score(
-            pool_path=pool_path,
+            pool_path=pool_source,
             query_run=query_run,
             pool_preconditioner_run=pool_pre if args.preconditioning_mode == "mixed" else None,
             score_run=score_run,
@@ -446,11 +442,14 @@ def main() -> None:
         allow_random_overlap=args.allow_random_overlap,
     )
 
-    continuation_manifest = dict(manifest)
-    continuation_splits = dict(continuation_manifest.get("splits", {}))
-    continuation_splits["top_k"] = subset_payload["arms"]["top_k"]
-    continuation_splits["matched_random_k"] = subset_payload["arms"]["matched_random_k"]
-    continuation_manifest["splits"] = continuation_splits
+    continuation_manifest = {
+        **manifest,
+        "splits": {
+            **manifest.get("splits", {}),
+            "top_k": subset_payload["arms"]["top_k"],
+            "matched_random_k": subset_payload["arms"]["matched_random_k"],
+        },
+    }
 
     continuation_path = out / "continuation_manifest.json"
     continuation_path.write_text(json.dumps(continuation_manifest, indent=2))

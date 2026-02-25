@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """Evaluation wrapper using lm-eval harness.
 
 Works for both base and LoRA SFT-adapted models. MC tasks use log-prob scoring.
@@ -20,6 +18,7 @@ Typical usage:
     --apply-chat-template \\
     --output-json runs/smoltalk_v4/eval.json
 """
+from __future__ import annotations
 
 import argparse
 import json
@@ -86,14 +85,6 @@ def build_model_args(args: argparse.Namespace) -> str:
     return ",".join(parts)
 
 
-def build_eval_kwargs(args: argparse.Namespace) -> dict:
-    """Extra kwargs to pass to lm_eval.simple_evaluate based on flags."""
-    kwargs: dict = {}
-    if args.apply_chat_template:
-        kwargs["apply_chat_template"] = True
-    return kwargs
-
-
 def run(args: argparse.Namespace) -> None:
     tasks = [t.strip() for t in args.tasks.split(",") if t.strip()]
     model_args = build_model_args(args)
@@ -110,8 +101,8 @@ def run(args: argparse.Namespace) -> None:
     print()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    extra = {"apply_chat_template": True} if args.apply_chat_template else {}
 
-    extra = build_eval_kwargs(args)
     results = lm_eval.simple_evaluate(  # type: ignore[call-arg]
         model="hf",
         model_args=model_args,
