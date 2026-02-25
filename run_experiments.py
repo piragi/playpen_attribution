@@ -107,6 +107,8 @@ CONFIG = {
     # selection + LoRA training) without re-running steps 1–5. Adapters/evals are
     # tagged _s{finetune_seed} so previous results are never overwritten.
     "finetune_seed": [43],           # None → use seed; set e.g. 43, 44, 45 for multi-seed runs
+    "skip_half_arms": False,         # skip *_50pct continuation arms
+    "arm_allowlist": None,           # e.g. {"quality_math_da", "random"}
 
     # ── eval_harness ─────────────────────────────────────────────────────────
     "run_eval": True,
@@ -187,7 +189,14 @@ def main() -> None:
 
         print(f"\n=== 7) finetune continuation arms (seed={finetune_seed}) ===")
         cont_manifest = json.loads((run_dir / "continuation" / "continuation_manifest.json").read_text())
-        for arm_name, arm_info in cont_manifest["arms"].items():
+        arm_items = list(cont_manifest["arms"].items())
+        if cfg.get("skip_half_arms"):
+            arm_items = [(n, i) for n, i in arm_items if not n.endswith("_50pct")]
+        if cfg.get("arm_allowlist"):
+            allow = set(cfg["arm_allowlist"])
+            arm_items = [(n, i) for n, i in arm_items if n in allow]
+
+        for arm_name, arm_info in arm_items:
             print(f"\n  --- arm: {arm_name} ---")
             finetune.run({
                 **cfg,
@@ -202,7 +211,7 @@ def main() -> None:
         if cfg["run_eval"]:
             eval_dir = run_dir / "evals"
             eval_dir.mkdir(parents=True, exist_ok=True)
-            for arm_name in cont_manifest["arms"]:
+            for arm_name, _ in arm_items:
                 eval_harness.run({
                     **cfg,
                     "adapter_path": str(run_dir / f"adapter_{arm_name}{exp_suffix}{seed_tag}"),
