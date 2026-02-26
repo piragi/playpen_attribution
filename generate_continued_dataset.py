@@ -52,6 +52,7 @@ CONFIG = {
     "pool_size": 30_000,
     "quality_size": 10_000,         # rows in the full quality arm (and label arm)
     "random_size": 10_000,
+    "match_control_tokens": True,   # match random/label total tokens to quality arm
     "gen_batch_size": 64,
     "seed": 42,
 }
@@ -262,6 +263,96 @@ def select_label(pool_rows: list[dict], cat_groups: dict[str, list[int]], qualit
     return sorted(selected)
 
 
+def _tokens_per_row(pool_rows: list[dict]) -> np.ndarray:
+    """Per-row training tokens (full sequence length)."""
+    return np.array([int(r.get("length", len(r["input_ids"]))) for r in pool_rows], dtype=np.int32)
+
+
+def _category_token_totals(indices: list[int], pool_rows: list[dict], token_counts: np.ndarray) -> dict[str, int]:
+    """Map category → total supervised tokens for selected indices."""
+    totals: dict[str, int] = {}
+    for i in indices:
+        cat = pool_rows[i].get("category") or ""
+        totals[cat] = totals.get(cat, 0) + int(token_counts[i])
+    return totals
+
+
+def _select_to_token_targets(
+    candidates_by_cat: dict[str, list[int]],
+    token_counts: np.ndarray,
+    target_tokens_by_cat: dict[str, int],
+    *,
+    shuffle_seed: int | None = None,
+) -> list[int]:
+    """Select indices until category token targets are met, then fill any deficit."""
+    selected: list[int] = []
+    selected_set: set[int] = set()
+    total_target = int(sum(target_tokens_by_cat.values()))
+    total_tokens = 0
+
+    for cat, target in target_tokens_by_cat.items():
+        cat_tokens = 0
+        for i in candidates_by_cat.get(cat, []):
+            if cat_tokens >= target:
+                break
+            t = int(token_counts[i])
+            selected.append(i)
+            selected_set.add(i)
+            cat_tokens += t
+            total_tokens += t
+
+    if total_tokens < total_target:
+        leftovers = [i for cands in candidates_by_cat.values() for i in cands if i not in selected_set]
+        if shuffle_seed is not None:
+            rng = np.random.default_rng(shuffle_seed)
+            rng.shuffle(leftovers)
+        for i in leftovers:
+            selected.append(i)
+            total_tokens += int(token_counts[i])
+            if total_tokens >= total_target:
+                break
+    return sorted(selected)
+
+
+def select_random_token_matched(
+    cat_groups: dict[str, list[int]],
+    token_counts: np.ndarray,
+    target_tokens_by_cat: dict[str, int],
+    exclude: set[int],
+    seed: int,
+) -> list[int]:
+    """Random baseline matched to category token targets from quality arm."""
+    rng = np.random.default_rng(seed)
+    candidates_by_cat: dict[str, list[int]] = {}
+    for cat, idxs in cat_groups.items():
+        candidates = [i for i in idxs if i not in exclude]
+        rng.shuffle(candidates)
+        candidates_by_cat[cat] = candidates
+    return _select_to_token_targets(
+        candidates_by_cat, token_counts, target_tokens_by_cat, shuffle_seed=seed + 1
+    )
+
+
+def select_label_token_matched(
+    pool_rows: list[dict],
+    cat_groups: dict[str, list[int]],
+    token_counts: np.ndarray,
+    qualities: set[str],
+    target_tokens_by_cat: dict[str, int],
+) -> list[int]:
+    """Label baseline matched to category token targets from quality arm."""
+    rank = {"excellent": 3, "good": 2, "fair": 1, "poor": 0}
+    candidates_by_cat = {
+        cat: sorted(
+            [i for i in idxs if pool_rows[i].get("quality", "").strip().lower() in qualities],
+            key=lambda i: rank.get(pool_rows[i].get("quality", ""), -1),
+            reverse=True,
+        )
+        for cat, idxs in cat_groups.items()
+    }
+    return _select_to_token_targets(candidates_by_cat, token_counts, target_tokens_by_cat)
+
+
 def save_arm(pool_rows: list[dict], indices: list[int], out_dir: Path, name: str) -> dict:
     """Save a dataset arm and return its manifest entry."""
     rows = [pool_rows[i] for i in indices]
@@ -342,8 +433,11 @@ def run(cfg: dict) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     cat_groups = _group_by_category(pool_rows)
+    token_counts = _tokens_per_row(pool_rows)
     arms: dict[str, dict] = {}
     all_quality_idx: set[int] = set()
+    control_quality_idx: list[int] | None = None
+    control_quality_50_idx: list[int] | None = None
 
     for j, name in enumerate(probe_names):
         scores = scores_matrix[:, j]
@@ -351,20 +445,39 @@ def run(cfg: dict) -> None:
         quality_idx    = select_quality(scores, cat_groups, cfg["quality_size"])
         quality_50_idx = select_quality(scores, cat_groups, cfg["quality_size"] // 2)
         all_quality_idx.update(quality_idx)
+        if control_quality_idx is None:
+            control_quality_idx = quality_idx
+            control_quality_50_idx = quality_50_idx
 
         arms[f"quality_{name}"]       = save_arm(pool_rows, quality_idx,    out_dir, f"quality_{name}")
         arms[f"quality_{name}_50pct"] = save_arm(pool_rows, quality_50_idx, out_dir, f"quality_{name}_50pct")
 
-    random_idx = select_random(cat_groups, cfg.get("random_size", 10_000), all_quality_idx, cfg.get("seed", 42))
+    if cfg.get("match_control_tokens", True) and control_quality_idx is not None and control_quality_50_idx is not None:
+        target_tokens = _category_token_totals(control_quality_idx, pool_rows, token_counts)
+        target_tokens_50 = _category_token_totals(control_quality_50_idx, pool_rows, token_counts)
+        random_idx = select_random_token_matched(
+            cat_groups, token_counts, target_tokens, all_quality_idx, cfg.get("seed", 42)
+        )
+        random_50_idx = select_random_token_matched(
+            cat_groups, token_counts, target_tokens_50, all_quality_idx, cfg.get("seed", 42)
+        )
+        label_idx = select_label_token_matched(
+            pool_rows, cat_groups, token_counts, {"good", "excellent"}, target_tokens
+        )
+        label_50_idx = select_label_token_matched(
+            pool_rows, cat_groups, token_counts, {"good", "excellent"}, target_tokens_50
+        )
+    else:
+        random_idx = select_random(cat_groups, cfg.get("random_size", 10_000), all_quality_idx, cfg.get("seed", 42))
+        random_50_idx = select_random(
+            cat_groups, cfg.get("random_size", 10_000) // 2, all_quality_idx, cfg.get("seed", 42)
+        )
+        label_idx = select_label(pool_rows, cat_groups, {"good", "excellent"}, cfg["quality_size"])
+        label_50_idx = select_label(pool_rows, cat_groups, {"good", "excellent"}, cfg["quality_size"] // 2)
+
     arms["random"] = save_arm(pool_rows, random_idx, out_dir, "random")
-
-    random_50_idx = select_random(cat_groups, cfg.get("random_size", 10_000) // 2, all_quality_idx, cfg.get("seed", 42))
     arms["random_50pct"] = save_arm(pool_rows, random_50_idx, out_dir, "random_50pct")
-
-    label_idx = select_label(pool_rows, cat_groups, {"good", "excellent"}, cfg["quality_size"])
     arms["label_good_excellent"] = save_arm(pool_rows, label_idx, out_dir, "label_good_excellent")
-
-    label_50_idx = select_label(pool_rows, cat_groups, {"good", "excellent"}, cfg["quality_size"] // 2)
     arms["label_good_excellent_50pct"] = save_arm(pool_rows, label_50_idx, out_dir, "label_good_excellent_50pct")
 
     cont_manifest = {
@@ -376,6 +489,7 @@ def run(cfg: dict) -> None:
             for s in probe_specs
         ],
         "pool_size": n_pool,
+        "match_control_tokens": bool(cfg.get("match_control_tokens", True)),
         "arms": arms,
     }
     cont_path = out_dir / "continuation_manifest.json"

@@ -108,6 +108,7 @@ CONFIG = {
     # tagged _s{finetune_seed} so previous results are never overwritten.
     "finetune_seed": [43],           # None → use seed; set e.g. 43, 44, 45 for multi-seed runs
     "skip_half_arms": False,         # skip *_50pct continuation arms
+    "token_matched_controls_only": False,  # only random* + label_good_excellent* arms
     "arm_allowlist": None,           # e.g. {"quality_math_da", "random"}
 
     # ── eval_harness ─────────────────────────────────────────────────────────
@@ -143,6 +144,8 @@ def _clear_gpu() -> None:
 
 def main() -> None:
     cfg = dict(SMOKE_CONFIG if "--smoke" in sys.argv else CONFIG)
+    if "--token-controls-only" in sys.argv:
+        cfg["token_matched_controls_only"] = True
     run_dir = Path(cfg["run_dir"])
 
     # Default embedding extraction to the trained base adapter.
@@ -192,6 +195,11 @@ def main() -> None:
         arm_items = list(cont_manifest["arms"].items())
         if cfg.get("skip_half_arms"):
             arm_items = [(n, i) for n, i in arm_items if not n.endswith("_50pct")]
+        if cfg.get("token_matched_controls_only"):
+            arm_items = [
+                (n, i) for n, i in arm_items
+                if n.startswith("random") or n.startswith("label_good_excellent")
+            ]
         if cfg.get("arm_allowlist"):
             allow = set(cfg["arm_allowlist"])
             arm_items = [(n, i) for n, i in arm_items if n in allow]
