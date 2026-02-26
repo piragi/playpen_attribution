@@ -70,6 +70,7 @@ def _score_cache_signature(cfg: dict, manifest: dict, probe_paths: list[Path]) -
         "dataset": manifest["dataset"],
         "dataset_config": manifest["dataset_config"],
         "raw_rows_consumed": manifest.get("raw_rows_consumed"),
+        "attr_query_raw_rows_consumed": manifest.get("attr_query_raw_rows_consumed"),
         "max_length": manifest["max_length"],
         "base_model": manifest["base_model"],
         "gen_adapter_path": cfg.get("gen_adapter_path"),
@@ -133,11 +134,14 @@ def score_batch(batch_rows, probes, model, captured, device) -> np.ndarray:
 def stream_and_score(cfg, manifest, probes, model, captured, device) -> tuple[list[dict], np.ndarray]:
     """Stream SmolTalk, tokenize, and score each example with all probes.
 
-    Skips rows already consumed by build_sft_data.py to prevent data leakage.
+    Skips rows consumed by build_sft_data.py and rebuild_attr_query.py
+    to prevent overlap leakage into continuation arms.
     Returns (pool_rows, scores_matrix) where scores_matrix is (n, n_probes).
     """
     tokenizer = load_tokenizer(manifest["base_model"])
-    skip_rows = manifest.get("raw_rows_consumed") or _estimate_skip_rows(manifest)
+    base_skip = manifest.get("raw_rows_consumed") or _estimate_skip_rows(manifest)
+    query_skip = manifest.get("attr_query_raw_rows_consumed", base_skip)
+    skip_rows = max(int(base_skip), int(query_skip))
     category_filter = cfg.get("category_filter")
 
     raw = load_dataset(manifest["dataset"], manifest["dataset_config"], split="train", streaming=True)
@@ -161,6 +165,11 @@ def stream_and_score(cfg, manifest, probes, model, captured, device) -> tuple[li
             score_pbar.update(n)
 
     print(f"Streaming {manifest['dataset']}, skipping {skip_rows:,} rows ...")
+    if skip_rows > int(base_skip):
+        print(
+            f"  includes attr_query prefix skip: base={int(base_skip):,}, "
+            f"attr_query={int(query_skip):,}"
+        )
     for i, row in enumerate(raw):
         if i < skip_rows:
             if skip_pbar is not None:

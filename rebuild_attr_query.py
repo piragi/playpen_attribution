@@ -92,10 +92,12 @@ def run(cfg: dict) -> None:
     collect_target = total_n * 2
     buckets: dict[str, list[dict]] = {cat: [] for cat in sorted(category_filter)} if category_filter else {}
     quality_dist: dict[str, int] = {}
+    rows_seen_after_skip = 0
 
     for i, row in enumerate(raw):
         if i < skip_rows:
             continue
+        rows_seen_after_skip += 1
         quality = row.get("quality", "")
         category = row.get("category", "")
         quality_dist[quality] = quality_dist.get(quality, 0) + 1
@@ -184,8 +186,10 @@ def run(cfg: dict) -> None:
         "rows": len(query_ds),
         "total_tokens": int(sum(query_ds["length"])),
     }
+    manifest["attr_query_raw_rows_consumed"] = skip_rows + rows_seen_after_skip
     manifest_path.write_text(json.dumps(manifest, indent=2))
     print(f"\nSaved {len(query_ds)} rows → {out_path}  (manifest key: {split_key})")
+    print(f"attr_query_raw_rows_consumed={manifest['attr_query_raw_rows_consumed']:,}")
 
 
 def main() -> None:
