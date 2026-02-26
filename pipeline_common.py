@@ -146,7 +146,7 @@ def mask_prompt(
 
 def get_magpie_score(row: dict) -> float:
     """Extract Magpie quality score from a SmolTalk row."""
-    for key in ("score", "quality_score", "magpie_score"):
+    for key in ("score", "quality_score", "magpie_score", "reward_model_score"):
         val = row.get(key)
         if isinstance(val, (int, float)):
             return float(val)
