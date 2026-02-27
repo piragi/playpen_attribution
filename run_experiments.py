@@ -36,7 +36,7 @@ import score
 
 CONFIG = {
     # ── Shared ───────────────────────────────────────────────────────────────
-    "run_dir": "runs/smoltalk_v5",
+    "run_dir": "runs/smoltalk_v6_reasoning_planning",
     "base_model": "HuggingFaceTB/SmolLM2-1.7B",
     "seed": 42,
     "exp_tag": "",  # optional suffix for continuation outputs (e.g. "ms1200_lr3e-4")
@@ -45,9 +45,9 @@ CONFIG = {
     "dataset_name": "HuggingFaceTB/smoltalk",
     "dataset_config": "smol-magpie-ultra",
     "max_length": 2048,
-    "category_filter": {"math", "data-analysis"},
-    "train_size": 5_000,
-    "val_size": 500,
+    "category_filter": {"reasoning", "planning"},
+    "train_size": 4_000,
+    "val_size": 400,
     "attr_pool_size": 0,
     "smoke_test": False,
 
@@ -69,12 +69,12 @@ CONFIG = {
     "lora_target_modules": "q_proj,k_proj,v_proj,o_proj",
 
     # ── rebuild_attr_query ───────────────────────────────────────────────────
-    "query_category": None,          # None | "math" | "data-analysis" | "all"
-    "query_smol_size": 4096,
+    "query_category": None,          # None | "reasoning" | "planning" | "all"
+    "query_smol_size": 2_048,
     "query_quality_min": {"good", "excellent"},
 
     # ── score ────────────────────────────────────────────────────────────────
-    "score_output_dir": "runs/smoltalk_v5/scores_math_da",
+    "score_output_dir": "runs/smoltalk_v6_reasoning_planning/scores_reasoning_planning",
     "query_split": "attr_query",
     "pool_split": "score_pool",
     "projection_dim": 32,
@@ -88,7 +88,7 @@ CONFIG = {
 
     # ── probe ────────────────────────────────────────────────────────────────
     # scores_dir defaults to score_output_dir when not set per-probe
-    "probes": [{"name": "math_da"}],
+    "probes": [{"name": "reasoning_planning"}],
     "extraction_layer": 17,
     "probe_adapter_path": None,      # None → use {run_dir}/adapter; set to override
     "ridge_alpha": 100.0,
@@ -96,9 +96,9 @@ CONFIG = {
     "probe_batch_size": 64,
 
     # ── generate_continued_dataset ───────────────────────────────────────────
-    "pool_size": 30_000,
-    "quality_size": 10_000,
-    "random_size": 10_000,
+    "pool_size": 20_000,
+    "quality_size": 7_000,
+    "random_size": 7_000,
     "gen_batch_size": 64,
     "gen_adapter_path": None,        # None → use {run_dir}/adapter; set to override
 
@@ -106,10 +106,10 @@ CONFIG = {
     # Set finetune_seed to re-run steps 6–8 with different randomness (random arm
     # selection + LoRA training) without re-running steps 1–5. Adapters/evals are
     # tagged _s{finetune_seed} so previous results are never overwritten.
-    "finetune_seed": [43],           # None → use seed; set e.g. 43, 44, 45 for multi-seed runs
+    "finetune_seed": [43, 44, 45],   # None → use seed; set e.g. 43, 44, 45 for multi-seed runs
     "skip_half_arms": False,         # skip *_50pct continuation arms
     "token_matched_controls_only": False,  # only random* + label_good_excellent* arms
-    "arm_allowlist": None,           # e.g. {"quality_math_da", "random"}
+    "arm_allowlist": None,           # e.g. {"quality_reasoning_planning", "random"}
 
     # ── eval_harness ─────────────────────────────────────────────────────────
     "run_eval": True,
@@ -155,23 +155,23 @@ def main() -> None:
     if cfg.get("gen_adapter_path") is None:
         cfg["gen_adapter_path"] = base_adapter
 
-    # print("\n=== 1) build_sft_data ===")
-    # build_sft_data.run(cfg)
-# 
-    # print("\n=== 2) finetune base adapter ===")
-    # finetune.run(cfg)
-    # _clear_gpu()
-# 
-    # print("\n=== 3) rebuild_attr_query ===")
-    # rebuild_attr_query.run(cfg)
-# 
-    # print("\n=== 4) score ===")
-    # score.run(cfg)
-    # _clear_gpu()
-# 
-    # print("\n=== 5) probe ===")
-    # probe.run(cfg)
-    # _clear_gpu()
+    print("\n=== 1) build_sft_data ===")
+    build_sft_data.run(cfg)
+
+    print("\n=== 2) finetune base adapter ===")
+    finetune.run(cfg)
+    _clear_gpu()
+
+    print("\n=== 3) rebuild_attr_query ===")
+    rebuild_attr_query.run(cfg)
+
+    print("\n=== 4) score ===")
+    score.run(cfg)
+    _clear_gpu()
+
+    print("\n=== 5) probe ===")
+    probe.run(cfg)
+    _clear_gpu()
 
     seed_cfg = cfg.get("finetune_seed")
     finetune_seeds = (
