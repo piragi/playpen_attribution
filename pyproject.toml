@@ -7,6 +7,7 @@ requires-python = ">=3.13"
 dependencies = [
     "anthropic",
     "bergson",
+    "bigcode-eval",
     "datasets>=4.5.0",
     "google-genai",
     "immutabledict>=4.3.1",
@@ -19,4 +20,7 @@ dependencies = [
     "transformers>=4.55.0,<4.56.0",
     "trl>=0.22,<0.23",
 ]
+
+[tool.uv.sources]
+bigcode-eval = { git = "https://github.com/bigcode-project/bigcode-evaluation-harness" }
 
