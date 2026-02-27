@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 
 import lm_eval
@@ -48,6 +49,7 @@ transformers.AutoModelForCausalLM.from_pretrained = _from_pretrained_compat
 # Log-prob MC: arc_challenge, arc_easy, hellaswag, winogrande (, mmlu — commented: 57 subtasks, very slow)
 # Generation: ifeval (rule-based instruction following), gsm8k (math reasoning, 5-shot)
 DEFAULT_TASKS = "arc_challenge,arc_easy,hellaswag,winogrande,ifeval,gsm8k"  #,mmlu"
+_CODE_EVAL_TASK_HINTS = ("humaneval", "mbpp", "code_eval")
 
 # Metric keys lm-eval uses per task (in priority order).
 _METRIC_PRIORITY = [
@@ -69,6 +71,19 @@ def best_metric(task_result: dict) -> tuple[str, float] | tuple[None, None]:
         if isinstance(v, float):
             return k, v
     return None, None
+
+
+def maybe_enable_code_eval(tasks: list[str]) -> bool:
+    """Enable code-eval safety switches only when code tasks are requested."""
+    lowered = [t.lower() for t in tasks]
+    needs_code_eval = any(
+        any(hint in task for hint in _CODE_EVAL_TASK_HINTS)
+        for task in lowered
+    )
+    if needs_code_eval and os.environ.get("HF_ALLOW_CODE_EVAL") != "1":
+        os.environ["HF_ALLOW_CODE_EVAL"] = "1"
+        print("set HF_ALLOW_CODE_EVAL=1 (code evaluation tasks detected)")
+    return needs_code_eval
 
 
 def build_model_args(args: argparse.Namespace) -> str:
@@ -106,6 +121,7 @@ def run(cfg: dict) -> None:
 
 def run_from_args(args: argparse.Namespace) -> None:
     tasks = [t.strip() for t in args.tasks.split(",") if t.strip()]
+    needs_code_eval = maybe_enable_code_eval(tasks)
     model_args = build_model_args(args)
     num_fewshot = args.num_fewshot if args.num_fewshot >= 0 else None
     limit = args.limit if args.limit > 0 else None
@@ -130,6 +146,7 @@ def run_from_args(args: argparse.Namespace) -> None:
         limit=limit,
         device=device,
         batch_size=args.batch_size,
+        confirm_run_unsafe_code=needs_code_eval,
         **extra,
     )
     if results is None:
