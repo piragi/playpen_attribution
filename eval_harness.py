@@ -54,9 +54,9 @@ _BIGCODE_TASK_MAP = {
     "humaneval": ("humaneval", 0.2, 200, 1024, False),
     "humaneval_instruct": ("instruct-humaneval", 0.2, 200, 1024, True),
     "mbpp": ("mbpp", 0.1, 15, 512, False),
-    "mbpp_instruct": ("mbpp", 0.1, 15, 512, False),
+    "mbpp_instruct": ("mbpp", 0.1, 15, 512, True),
     "mbpp_plus": ("mbppplus", 0.1, 15, 1024, False),
-    "mbpp_plus_instruct": ("mbppplus", 0.1, 15, 1024, False),
+    "mbpp_plus_instruct": ("mbppplus", 0.1, 15, 1024, True),
 }
 
 # Metric keys lm-eval uses per task (in priority order).
@@ -98,7 +98,7 @@ def _instruction_tokens_for_smollm(base_model: str) -> str:
     tok = transformers.AutoTokenizer.from_pretrained(base_model)
     bos = tok.bos_token or "<|im_start|>"
     eos = tok.eos_token or "<|im_end|>"
-    return f"{bos}user\\n,{eos}\\n,{bos}assistant\\n"
+    return f"{bos}user\n,{eos}\n,{bos}assistant\n"
 
 
 def _best_numeric_metric(task_result: dict) -> tuple[str, float] | tuple[None, None]:
