@@ -36,7 +36,7 @@ import score
 
 CONFIG = {
     # ── Shared ───────────────────────────────────────────────────────────────
-    "run_dir": "runs/smoltalk_v6_reasoning_planning",
+    "run_dir": "runs/smoltalk_v6_coding",
     "base_model": "HuggingFaceTB/SmolLM2-1.7B",
     "seed": 42,
     "exp_tag": "",  # optional suffix for continuation outputs (e.g. "ms1200_lr3e-4")
@@ -45,7 +45,7 @@ CONFIG = {
     "dataset_name": "HuggingFaceTB/smoltalk",
     "dataset_config": "smol-magpie-ultra",
     "max_length": 2048,
-    "category_filter": {"reasoning", "planning"},
+    "category_filter": {"coding"},
     "train_size": 4_000,
     "val_size": 400,
     "attr_pool_size": 0,
@@ -69,12 +69,12 @@ CONFIG = {
     "lora_target_modules": "q_proj,k_proj,v_proj,o_proj",
 
     # ── rebuild_attr_query ───────────────────────────────────────────────────
-    "query_category": None,          # None | "reasoning" | "planning" | "all"
+    "query_category": None,          # None | "coding" | "all"
     "query_smol_size": 2_048,
     "query_quality_min": {"good", "excellent"},
 
     # ── score ────────────────────────────────────────────────────────────────
-    "score_output_dir": "runs/smoltalk_v6_reasoning_planning/scores_reasoning_planning",
+    "score_output_dir": "runs/smoltalk_v6_coding/scores_coding",
     "query_split": "attr_query",
     "pool_split": "score_pool",
     "projection_dim": 32,
@@ -88,7 +88,7 @@ CONFIG = {
 
     # ── probe ────────────────────────────────────────────────────────────────
     # scores_dir defaults to score_output_dir when not set per-probe
-    "probes": [{"name": "reasoning_planning"}],
+    "probes": [{"name": "coding"}],
     "extraction_layer": 17,
     "probe_adapter_path": None,      # None → use {run_dir}/adapter; set to override
     "ridge_alpha": 100.0,
@@ -107,13 +107,13 @@ CONFIG = {
     # selection + LoRA training) without re-running steps 1–5. Adapters/evals are
     # tagged _s{finetune_seed} so previous results are never overwritten.
     "finetune_seed": [43, 44, 45],   # None → use seed; set e.g. 43, 44, 45 for multi-seed runs
-    "skip_half_arms": False,         # skip *_50pct continuation arms
+    "skip_half_arms": True,         # skip *_50pct continuation arms
     "token_matched_controls_only": False,  # only random* + label_good_excellent* arms
-    "arm_allowlist": None,           # e.g. {"quality_reasoning_planning", "random"}
+    "arm_allowlist": None,           # e.g. {"quality_coding", "random"}
 
     # ── eval_harness ─────────────────────────────────────────────────────────
     "run_eval": True,
-    "eval_tasks": "arc_challenge,arc_easy,hellaswag,winogrande,ifeval,gsm8k",
+    "eval_tasks": "humaneval_instruct,mbpp_instruct,mbpp_plus_instruct,ifeval",
     "eval_batch_size": "32",
 }
 
