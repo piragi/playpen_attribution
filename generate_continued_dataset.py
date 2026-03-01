@@ -353,6 +353,31 @@ def select_label_token_matched(
     return _select_to_token_targets(candidates_by_cat, token_counts, target_tokens_by_cat)
 
 
+def select_top_length(
+    pool_rows: list[dict],
+    cat_groups: dict[str, list[int]],
+    token_counts: np.ndarray,
+    n: int,
+    qualities: set[str] | None = None,
+) -> list[int]:
+    """Return indices of top-n rows by sequence length, stratified by category.
+
+    If qualities is set, only consider rows with matching quality labels.
+    """
+    quotas = _category_quotas(cat_groups, n)
+    selected: list[int] = []
+    for cat, quota in quotas.items():
+        candidates = cat_groups[cat]
+        if qualities:
+            candidates = [
+                i for i in candidates
+                if pool_rows[i].get("quality", "").strip().lower() in qualities
+            ]
+        top = sorted(candidates, key=lambda i: int(token_counts[i]), reverse=True)[:quota]
+        selected.extend(top)
+    return sorted(selected)
+
+
 def save_arm(pool_rows: list[dict], indices: list[int], out_dir: Path, name: str) -> dict:
     """Save a dataset arm and return its manifest entry."""
     rows = [pool_rows[i] for i in indices]
@@ -479,6 +504,13 @@ def run(cfg: dict) -> None:
     arms["random_50pct"] = save_arm(pool_rows, random_50_idx, out_dir, "random_50pct")
     arms["label_good_excellent"] = save_arm(pool_rows, label_idx, out_dir, "label_good_excellent")
     arms["label_good_excellent_50pct"] = save_arm(pool_rows, label_50_idx, out_dir, "label_good_excellent_50pct")
+
+    # Length control: top-by-length within good/excellent labels
+    top_len_idx = select_top_length(
+        pool_rows, cat_groups, token_counts, cfg["quality_size"],
+        qualities={"good", "excellent"},
+    )
+    arms["top_length_good_excellent"] = save_arm(pool_rows, top_len_idx, out_dir, "top_length_good_excellent")
 
     cont_manifest = {
         "base_model": base_model,

@@ -115,6 +115,8 @@ CONFIG = {
     "run_eval": True,
     "eval_tasks": "humaneval_instruct,mbpp_instruct,mbpp_plus_instruct,ifeval",
     "eval_batch_size": "32",
+    "code_n_samples_humaneval": 200,
+    "code_n_samples_mbpp": 15,
 }
 
 SMOKE_CONFIG = {
