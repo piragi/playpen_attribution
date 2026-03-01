@@ -353,29 +353,27 @@ def select_label_token_matched(
     return _select_to_token_targets(candidates_by_cat, token_counts, target_tokens_by_cat)
 
 
-def select_top_length(
+def select_top_length_token_matched(
     pool_rows: list[dict],
     cat_groups: dict[str, list[int]],
     token_counts: np.ndarray,
-    n: int,
+    target_tokens_by_cat: dict[str, int],
     qualities: set[str] | None = None,
 ) -> list[int]:
-    """Return indices of top-n rows by sequence length, stratified by category.
+    """Return indices sorted by descending length until per-category token targets are met.
 
     If qualities is set, only consider rows with matching quality labels.
     """
-    quotas = _category_quotas(cat_groups, n)
-    selected: list[int] = []
-    for cat, quota in quotas.items():
-        candidates = cat_groups[cat]
+    candidates_by_cat: dict[str, list[int]] = {}
+    for cat, idxs in cat_groups.items():
+        cands = idxs
         if qualities:
-            candidates = [
-                i for i in candidates
+            cands = [
+                i for i in cands
                 if pool_rows[i].get("quality", "").strip().lower() in qualities
             ]
-        top = sorted(candidates, key=lambda i: int(token_counts[i]), reverse=True)[:quota]
-        selected.extend(top)
-    return sorted(selected)
+        candidates_by_cat[cat] = sorted(cands, key=lambda i: int(token_counts[i]), reverse=True)
+    return _select_to_token_targets(candidates_by_cat, token_counts, target_tokens_by_cat)
 
 
 def save_arm(pool_rows: list[dict], indices: list[int], out_dir: Path, name: str) -> dict:
@@ -505,12 +503,14 @@ def run(cfg: dict) -> None:
     arms["label_good_excellent"] = save_arm(pool_rows, label_idx, out_dir, "label_good_excellent")
     arms["label_good_excellent_50pct"] = save_arm(pool_rows, label_50_idx, out_dir, "label_good_excellent_50pct")
 
-    # Length control: top-by-length within good/excellent labels
-    top_len_idx = select_top_length(
-        pool_rows, cat_groups, token_counts, cfg["quality_size"],
-        qualities={"good", "excellent"},
-    )
-    arms["top_length_good_excellent"] = save_arm(pool_rows, top_len_idx, out_dir, "top_length_good_excellent")
+    # Length control: top-by-length within good/excellent labels, token-matched
+    if control_quality_idx is not None:
+        length_target = target_tokens if cfg.get("match_control_tokens", True) else _category_token_totals(control_quality_idx, pool_rows, token_counts)
+        top_len_idx = select_top_length_token_matched(
+            pool_rows, cat_groups, token_counts, length_target,
+            qualities={"good", "excellent"},
+        )
+        arms["top_length_good_excellent"] = save_arm(pool_rows, top_len_idx, out_dir, "top_length_good_excellent")
 
     cont_manifest = {
         "base_model": base_model,
