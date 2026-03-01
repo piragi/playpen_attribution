@@ -119,7 +119,9 @@ def run_score(
     score_run: Path,
     args: argparse.Namespace,
 ) -> None:
-    bergson_mode = "individual" if args.score_mode == "nearest" else args.score_mode
+    # Both "nearest" and "individual" use bergson's "individual" scoring (per-query scores).
+    # The difference is in how we aggregate: nearest → max, individual → mean.
+    bergson_mode = "individual" if args.score_mode in {"nearest", "individual"} else args.score_mode
 
     if args.preconditioning_mode == "none":
         query_preconditioner_path = None
@@ -151,23 +153,35 @@ def run_score(
     )
 
 
-def get_score_vector(score_run: Path, score_mode: str) -> np.ndarray:
+def get_score_matrix(score_run: Path) -> np.ndarray:
+    """Load all per-query score columns as a (n_pool, n_query) float32 matrix."""
     scores = load_scores(score_run)
     raw = scores[:]
-    # Bergson stores a structured array with fields like score_0 (bfloat16), written_0 (bool).
-    # Extract the first score field as float32.
     if raw.dtype.names is not None:
-        score_fields = [n for n in raw.dtype.names if n.startswith("score_")]
-        matrix = raw[score_fields[0]].astype(np.float32)
+        score_fields = sorted(
+            [n for n in raw.dtype.names if n.startswith("score_")],
+            key=lambda n: int(n.split("_")[1]),
+        )
+        matrix = np.column_stack([raw[f].astype(np.float32) for f in score_fields])
     else:
         matrix = np.asarray(raw, dtype=np.float32)
+        if matrix.ndim == 1:
+            matrix = matrix.reshape(-1, 1)
+    return np.nan_to_num(matrix, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def get_score_vector(score_run: Path, score_mode: str) -> np.ndarray:
+    matrix = get_score_matrix(score_run)
 
     if score_mode == "nearest":
-        values = matrix if matrix.ndim == 1 else matrix.max(axis=1)
+        values = matrix.max(axis=1)
+    elif score_mode == "individual":
+        # Mean across all query examples → single score per pool example
+        values = matrix.mean(axis=1)
     else:
-        values = matrix if matrix.ndim == 1 else matrix[:, 0]
+        values = matrix[:, 0]
 
-    return np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)
+    return values
 
 
 def safe_corr(x: np.ndarray, y: np.ndarray) -> float | None:
@@ -305,7 +319,7 @@ def _run_scoring(args) -> None:
         args.adapter_path = args.base_model
 
     use_query_pre = args.preconditioning_mode in {"query", "mixed"}
-    if args.score_mode == "nearest":
+    if args.score_mode in {"nearest", "individual"}:
         run_build(query_source, query_run, args, compute_preconditioners=use_query_pre)
     else:
         run_reduce(query_source, query_run, args, compute_preconditioners=use_query_pre)
@@ -324,6 +338,13 @@ def _run_scoring(args) -> None:
     scores = get_score_vector(score_run, args.score_mode)
     pool_ds = load_from_disk(str(pool_source))
     score_data_ds = load_from_disk(str(score_run / "data.hf"))
+
+    # Save full score matrix for individual mode analysis
+    if args.score_mode == "individual":
+        matrix = get_score_matrix(score_run)
+        matrix_path = out / "score_matrix.npy"
+        np.save(str(matrix_path), matrix)
+        print(f"score matrix:    {matrix_path}  shape={matrix.shape}")
 
     rows = write_row_diagnostics(pool_ds, score_data_ds, scores, diagnostics_path)
     write_summary(rows, summary_path)
@@ -345,7 +366,7 @@ def main() -> None:
     parser.add_argument("--projection-dim", type=int, default=32)
     parser.add_argument("--preconditioning-mode", choices=["none", "query", "mixed"], default="query")
     parser.add_argument("--mixing-coefficient", type=float, default=0.99)
-    parser.add_argument("--score-mode", choices=["mean", "nearest"], default="mean")
+    parser.add_argument("--score-mode", choices=["mean", "nearest", "individual"], default="mean")
     parser.add_argument("--unit-normalize", dest="unit_normalize", action="store_true")
     parser.add_argument("--no-unit-normalize", dest="unit_normalize", action="store_false")
     parser.add_argument("--loss-reduction", choices=["mean", "sum"], default="mean")
